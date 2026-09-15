@@ -52,7 +52,9 @@ function validParams(method: string, p: unknown[]): boolean {
     case 'getRecentPrioritizationFees': return p.length === 0 || p.length === 1 && (Array.isArray(p[0]) && p[0].length === 0 || keys(p[0], 32));
     case 'getSignatureStatuses': return p.length >= 1 && p.length <= 2 && Array.isArray(p[0]) && p[0].length >= 1 && p[0].length <= 32 && p[0].every(signature) && (p[1] === undefined || object(p[1]) && allowedKeys(p[1], ['searchTransactionHistory']) && typeof p[1].searchTransactionHistory === 'boolean');
     case 'getTransaction': return p.length >= 1 && p.length <= 2 && signature(p[0]) && options(p[1], {encoding: v => v === 'json' || v === 'jsonParsed' || v === 'base64', maxSupportedTransactionVersion: v => v === 0});
-    case 'sendTransaction': return p.length === 2 && encoded(p[0]) && object(p[1]) && p[1].encoding === 'base64' && p[1].skipPreflight === false && allowedKeys(p[1], ['encoding', 'skipPreflight', 'preflightCommitment', 'maxRetries', 'minContextSlot']) && (p[1].preflightCommitment === undefined || commitment(p[1].preflightCommitment)) && uint(p[1].maxRetries, 3) && (p[1].minContextSlot === undefined || uint(p[1].minContextSlot));
+    // web3.js omits skipPreflight when its value is false. Omission has the
+    // same RPC meaning; true and malformed values must still be rejected.
+    case 'sendTransaction': return p.length === 2 && encoded(p[0]) && object(p[1]) && p[1].encoding === 'base64' && (p[1].skipPreflight === undefined || p[1].skipPreflight === false) && allowedKeys(p[1], ['encoding', 'skipPreflight', 'preflightCommitment', 'maxRetries', 'minContextSlot']) && (p[1].preflightCommitment === undefined || commitment(p[1].preflightCommitment)) && uint(p[1].maxRetries, 3) && (p[1].minContextSlot === undefined || uint(p[1].minContextSlot));
     case 'simulateTransaction': return p.length >= 1 && p.length <= 2 && encoded(p[0]) && options(p[1], {encoding: v => v === 'base64', sigVerify: v => typeof v === 'boolean', replaceRecentBlockhash: v => typeof v === 'boolean'});
     default: return false;
   }
@@ -177,9 +179,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!(await env.RPC_LIMIT.limit({key: rateKey})).success) return error(-32005, 'Too many requests. Wait a few seconds and retry.', 429);
     }
     if (calls.some(call => call.method === 'sendTransaction') && !(await env.RPC_SEND_LIMIT.limit({key: rateKey})).success) return error(-32005, 'Too many transaction submissions. Check the previous transaction before retrying.', 429);
+    // Keep preflight explicit upstream even when the SDK omitted false. Only
+    // the send options are normalized; approved transaction bytes are intact.
+    const forwardedCalls = calls.map(call => call.method === 'sendTransaction'
+      ? {...call, params: [call.params![0], {...call.params![1] as JsonObject, skipPreflight: false}]}
+      : call);
     const response = await fetch(endpoint.href, {
       method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'application/json'},
-      body: JSON.stringify(parsed), signal: controller.signal, redirect: 'manual',
+      body: JSON.stringify(batch ? forwardedCalls : forwardedCalls[0]), signal: controller.signal, redirect: 'manual',
     });
     if (!response.ok) {
       void response.body?.cancel().catch(() => {});

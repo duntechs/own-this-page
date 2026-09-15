@@ -3,6 +3,8 @@ import {ComputeBudgetProgram, Connection, PublicKey, SystemProgram, SYSVAR_CLOCK
 import {SOLANA_GENESIS, SOLANA_TREASURY, selectPriorityMicroLamports, withSolanaTimeout, type SolanaCluster} from './solana-client';
 import {encodeSolanaSignature} from './solana-wallet';
 import {validateSolanaTransactionCompatibility} from './solana-transaction-compatibility';
+import {DeploymentRpcError} from './solana-deployment-fetch';
+export {DeploymentRpcError} from './solana-deployment-fetch';
 
 // The release is pinned independently of anything supplied by localStorage or
 // an uploaded configuration. A replacement release requires a new review.
@@ -336,7 +338,7 @@ export class DeploymentEngine {
         // Only the already-approved signature is retried. A new blockhash is
         // never substituted into a signed or unresolved transaction.
         const pending = this.state!.pending.filter(p => height <= p.lastValidBlockHeight);
-        await Promise.allSettled(pending.map(p => this.broadcast(p)));
+        await this.broadcastSaved(pending);
       }
       await new Promise(resolve => setTimeout(resolve, 1_500));
     }
@@ -345,6 +347,14 @@ export class DeploymentEngine {
   private async broadcast(p: Pending) {
     const result = await this.rpc(this.connection.sendRawTransaction(Buffer.from(p.raw, 'base64'), {skipPreflight: false, preflightCommitment: COMMITMENT, maxRetries: 3, minContextSlot: this.state!.minimumContextSlot}));
     if (result !== p.signature) throw Error('The RPC returned a different deployment signature. The signed receipt is preserved.');
+  }
+  private async broadcastSaved(pending: Pending[]) {
+    const outcomes = await Promise.allSettled(pending.map(p => this.broadcast(p)));
+    // One rejected relay request does not establish what happened to the rest
+    // of a signed batch. Retain EVERY receipt and let normal reconciliation
+    // determine its outcome on resume. Network reply loss still follows the
+    // existing confirmation/rebroadcast path with the exact approved packet.
+    for (const outcome of outcomes) if (outcome.status === 'rejected' && outcome.reason instanceof DeploymentRpcError) throw outcome.reason;
   }
   private async send(actions: Action[], signer: DeploymentSigner, budget: {maximum: number; reserved: number}, dataRent: number) {
     if (!actions.length || actions.length > 5 || actions.length > 1 && actions.some(a => a.kind !== 'write')) throw Error('Invalid deployment transaction batch.');
@@ -388,7 +398,7 @@ export class DeploymentEngine {
     const batchSignatures = s.pending.map(receipt => receipt.signature);
     budget.reserved = sum(budget.reserved, signedBatchCost);
     this.update('confirming', 'Checking the signed deployment transactions on Solana.', s.pending[0].signature);
-    await Promise.allSettled(s.pending.map(p => this.broadcast(p)));
+    await this.broadcastSaved(s.pending);
     await this.confirmPending();
     // A finalized expiry settles a receipt but does not complete its action.
     // In particular, never proceed to Write after buffer creation expired.

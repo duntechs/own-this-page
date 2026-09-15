@@ -16,7 +16,7 @@ assert((await readFile(path.join(root, 'lib/solana-client.ts'), 'utf8')).include
 await build({configFile: false, root, publicDir: false, logLevel: 'silent', plugins: [{name: 'test-only-deployment-owner', transform(code, id) {
   if (id.endsWith('/lib/solana-client.ts')) return code.replaceAll(fixedOwner, payer.publicKey.toBase58());
 }}], build: {ssr: true, outDir: output, emptyOutDir: true, rollupOptions: {input: path.join(root, 'lib/solana-deploy.ts'), output: {entryFileNames: 'engine.mjs'}}}});
-const {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, DEPLOYMENT_PROGRAM_SHA256, DEPLOYMENT_PROGRAM_LENGTH, DEPLOYMENT_WRITE_BYTES, DEPLOYMENT_LOADER, deploymentProgramDataAddress} = await import(pathToFileURL(path.join(output, 'engine.mjs')).href);
+const {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, DeploymentRpcError, DEPLOYMENT_PROGRAM_SHA256, DEPLOYMENT_PROGRAM_LENGTH, DEPLOYMENT_WRITE_BYTES, DEPLOYMENT_LOADER, deploymentProgramDataAddress} = await import(pathToFileURL(path.join(output, 'engine.mjs')).href);
 const binary = Uint8Array.from(await readFile(path.join(root, 'solana-market/artifacts/slot_market.so')));
 assert.equal(binary.length, DEPLOYMENT_PROGRAM_LENGTH);
 const genesis = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
@@ -135,6 +135,43 @@ await check('lost submission response persists receipts and recovers on reload w
   f.onUpdate(p=>{if(p.stage==='uploading')e.pause();});
   await assert.rejects(async()=>e.run(f.signer,(await e.estimate()).requiredLamports),DeploymentPausedError);
   assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.equal(f.checkpoint().programId,saved.programId);assert.equal(f.checkpoint().pending.length,0);assert.equal(f.applied.filter(x=>x.kind==='buffer-account').length,1);assert(raw.length>0);
+});
+
+await check('a relay HTTP 400 surfaces immediately with its receipt intact and resume rebroadcasts the same approved packet',async()=>{
+  const f=fixture();let e=f.fresh();const estimate=await e.estimate(),send=f.rpc.sendRawTransaction,packets=[];
+  f.rpc.getSignatureStatuses=()=>assert.fail('An explicit submission error should surface before confirmation polling');
+  f.rpc.sendRawTransaction=async(bytes)=>{packets.push(Buffer.from(bytes).toString('base64'));throw new DeploymentRpcError(400,-32600);};
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>{
+    assert(error instanceof DeploymentRpcError);
+    assert.deepEqual(error.report,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:400,rpcCode:-32600});return true;
+  });
+  const saved=f.checkpoint();assert.equal(saved.pending.length,1);assert.equal(saved.pending[0].raw,packets[0]);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.applied.length,0);
+  f.rpc.getSignatureStatuses=async ids=>({context:{slot:100},value:ids.map(id=>f.receipts.get(id)??null)});
+  e=f.fresh();
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentRpcError);
+  assert.deepEqual(f.checkpoint().pending,saved.pending);assert.deepEqual(packets,[saved.pending[0].raw,saved.pending[0].raw]);assert.deepEqual(f.signedBatches,[1]);
+  f.rpc.sendRawTransaction=send;e=f.fresh();f.onUpdate(progress=>{if(progress.stage==='uploading')e.pause();});
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+  assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.equal(f.checkpoint().pending.length,0);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+  assert.equal(f.applied[0].signature,saved.pending[0].signature);
+});
+
+await check('one rejected upload in a partially accepted batch retains every receipt and recovers without new signatures',async()=>{
+  const f=fixture();let e=f.fresh();const estimate=await e.estimate(),send=f.rpc.sendRawTransaction;let rejectedPacket=null;
+  f.rpc.sendRawTransaction=async(bytes,options)=>{
+    const tx=VersionedTransaction.deserialize(bytes),write=TransactionMessage.decompile(tx.message).instructions.some(ix=>ix.programId.equals(DEPLOYMENT_LOADER)&&ix.data.readUInt32LE(0)===1);
+    if(write&&!rejectedPacket){rejectedPacket=Buffer.from(bytes).toString('base64');throw new DeploymentRpcError(400,-32600);}
+    return send(bytes,options);
+  };
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentRpcError);
+  const saved=f.checkpoint();assert.equal(saved.pending.length,5);assert(saved.pending.some(receipt=>receipt.raw===rejectedPacket));assert.deepEqual(f.signedBatches,[1,5]);
+  assert.equal(f.applied.filter(action=>action.kind==='write').length,4);
+  const acceptedSignatures=new Set(f.applied.filter(action=>action.kind==='write').map(action=>action.signature));
+  assert.equal(saved.pending.filter(receipt=>acceptedSignatures.has(receipt.signature)).length,4);
+  f.rpc.sendRawTransaction=send;e=f.fresh();f.onUpdate(progress=>{if(progress.stage==='uploading')e.pause();});
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+  assert.equal(f.checkpoint().pending.length,0);assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.deepEqual(f.signedBatches,[1,5]);assert.equal(f.applied.filter(action=>action.kind==='write').length,5);
+  assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
 });
 
 await check('a finalized expired unaccepted packet releases its reserve and reuses the saved seeded address',async()=>{

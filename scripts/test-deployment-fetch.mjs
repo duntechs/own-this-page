@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import path from 'node:path';
 import {build} from 'vite';
+import {Connection} from '@solana/web3.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const out = path.join(root, '.sites-runtime/deployment-fetch-tests');
 await build({configFile: false, root, publicDir: false, logLevel: 'silent', build: {ssr: true, outDir: out, emptyOutDir: true, rollupOptions: {input: path.join(root, 'lib/solana-deployment-fetch.ts'), output: {entryFileNames: 'fetch.mjs'}}}});
-const {createDeploymentRpcFetch} = await import(pathToFileURL(path.join(out, 'fetch.mjs')).href);
+const {createDeploymentRpcFetch, DeploymentRpcError} = await import(pathToFileURL(path.join(out, 'fetch.mjs')).href);
 const originalFetch = globalThis.fetch;
 const body = (method, id) => JSON.stringify({jsonrpc: '2.0', id, method, params: method === 'sendTransaction' ? [`signed-packet-${id}`, {encoding: 'base64'}] : []});
 const request = (queuedFetch, method, id, extra = {}) => queuedFetch('https://rpc.invalid/api/rpc', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: body(method, id), ...extra});
@@ -77,6 +78,38 @@ try {
     for (let i = 1; i < starts.length; i++) assert(starts[i].at - starts[i - 1].at >= 260, 'RPC dispatch spacing was bypassed');
     const sends = starts.filter(x => x.method === 'sendTransaction');
     for (let i = 1; i < sends.length; i++) assert(sends[i].at - sends[i - 1].at >= 1_125, 'Signed sends started too close together');
+  });
+
+  await check('HTTP and JSON-RPC submission errors survive web3.js with only bounded shareable protocol fields', async () => {
+    for (const [status, code] of [[400,-32600],[503,-32002],[200,-32003],[400,null]]) {
+      globalThis.fetch = async () => new Response(JSON.stringify({jsonrpc:'2.0',id:1,error:{code,message:'api-key=private-secret',data:'signed-packet-private'}}), {status});
+      const connection = new Connection('https://rpc.invalid/api/rpc?api-key=never-share', {fetch:createDeploymentRpcFetch(),disableRetryOnRateLimit:true});
+      await assert.rejects(() => connection.sendRawTransaction(Uint8Array.of(1,2,3), {skipPreflight:false}), error => {
+        assert(error instanceof DeploymentRpcError);
+        assert.deepEqual(error.report,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:status,rpcCode:code});
+        const exposed = error.message + JSON.stringify(error.report);
+        assert(exposed.length < 500);
+        for (const secret of ['private-secret','signed-packet-private','never-share','api-key','rpc.invalid']) assert(!exposed.includes(secret));
+        return true;
+      });
+    }
+  });
+
+  await check('cloned response inspection leaves successful sends and non-send responses readable and unchanged', async () => {
+    const responseBody = JSON.stringify({jsonrpc:'2.0',id:1,result:'unchanged-signature'});
+    globalThis.fetch = async () => new Response(responseBody,{status:200});
+    assert.equal(await (await request(createDeploymentRpcFetch(),'sendTransaction',1)).text(),responseBody);
+    const readError = JSON.stringify({error:{code:-32000,message:'read error'}});
+    globalThis.fetch = async () => new Response(readError,{status:503});
+    const read = await request(createDeploymentRpcFetch(),'getSignatureStatuses',2);
+    assert.equal(read.status,503);assert.equal(await read.text(),readError);
+    for(const code of ['-32000',Number.MAX_SAFE_INTEGER,0.5]) {
+      const malformed = JSON.stringify({error:{code,message:'never retained'}});
+      globalThis.fetch = async () => new Response(malformed,{status:400});
+      await assert.rejects(() => request(createDeploymentRpcFetch(),'sendTransaction',3),error => error instanceof DeploymentRpcError && error.report.rpcCode===null);
+    }
+    globalThis.fetch = async () => new Response('private-html-response'.repeat(2_000),{status:502});
+    await assert.rejects(() => request(createDeploymentRpcFetch(),'sendTransaction',4),error => error instanceof DeploymentRpcError && error.report.httpStatus===502 && error.report.rpcCode===null);
   });
 } finally {globalThis.fetch = originalFetch;}
 console.log(`Deployment fetch: ${count} checks passed; only mocked fetch was used.`);

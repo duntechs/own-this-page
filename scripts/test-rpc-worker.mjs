@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {stripTypeScriptTypes} from 'node:module';
+import vm from 'node:vm';
+import {fileURLToPath} from 'node:url';
+import {build} from 'vite';
+import {Keypair, SystemProgram, TransactionMessage, VersionedTransaction} from '@solana/web3.js';
 
 // Run the actual Worker handler with mocked bindings and upstream fetch. No
 // credential or live Solana request is used in these tests.
@@ -24,6 +28,25 @@ const oldFetch = globalThis.fetch;
 let passed = 0;
 async function test(name, fn) {await fn(); passed++; console.log(`ok ${passed} - ${name}`);}
 const bodyOf = async r => JSON.parse(await r.text());
+
+async function browserRpcClient(fetch) {
+  const fetchPath = fileURLToPath(new URL('../lib/solana-deployment-fetch.ts', import.meta.url));
+  const entry = fileURLToPath(new URL('../.sites-runtime/rpc-browser-regression.ts', import.meta.url));
+  const built = await build({
+    configFile: false, publicDir: false, logLevel: 'silent',
+    plugins: [{name: 'rpc-browser-fixture', resolveId(id) {if (id === entry) return '\0' + entry;}, load(id) {
+      if (id === '\0' + entry) return `export {Connection} from '@solana/web3.js'; export {createDeploymentRpcFetch} from ${JSON.stringify(fetchPath)};`;
+    }}],
+    build: {write: false, target: 'es2022', minify: false, lib: {entry, name: 'BrowserRpc', formats: ['iife']}},
+  });
+  const code = (Array.isArray(built) ? built : [built]).flatMap(item => item.output).find(item => item.type === 'chunk').code;
+  // Real browser dependency graph and pacing fetch, without Node Buffer or a
+  // live network. Browser-origin headers are supplied by the mock transport.
+  const context = vm.createContext({fetch, crypto: globalThis.crypto, URL, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, DataView, AbortSignal, AbortController, setTimeout, clearTimeout, setInterval, clearInterval, console});
+  vm.runInContext(code, context, {timeout: 10_000});
+  assert.equal(vm.runInContext('typeof Buffer', context), 'undefined');
+  return context.BrowserRpc;
+}
 try {
   await test('requires the exact runtime secret and a bounded Helius mainnet URL', async () => {
     assert.equal(heliusEndpoint(endpoint)?.href, endpoint);
@@ -42,6 +65,7 @@ try {
       call('getBlockHeight', [{commitment: 'finalized'}]), call('getEpochInfo', [{commitment: 'finalized'}]), call('getSlot'),
       call('getTransaction', [sig, {commitment: 'confirmed', maxSupportedTransactionVersion: 0}]),
       call('sendTransaction', [b64, {encoding: 'base64', skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3, minContextSlot: 100}]),
+      call('sendTransaction', [b64, {encoding: 'base64', preflightCommitment: 'confirmed', maxRetries: 3, minContextSlot: 100}]),
       call('simulateTransaction', [b64, {encoding: 'base64', sigVerify: false, replaceRecentBlockhash: false, commitment: 'confirmed', minContextSlot: 100}]),
     ]) assert(validRpcCall(value), value.method);
   });
@@ -54,6 +78,7 @@ try {
       call('getBalance', [treasury, {commitment: 'invalid'}]), call('getAccountInfo', [treasury, {encoding: 'jsonParsed'}]),
       call('getAccountInfo', [treasury, {dataSlice: {offset: 0, length: 262145}}]),
       call('sendTransaction', [b64, {encoding: 'base64', skipPreflight: true, maxRetries: 3}]),
+      ...[null, 0, 1, 'false', {}, []].map(skipPreflight => call('sendTransaction', [b64, {encoding: 'base64', skipPreflight, maxRetries: 3}])),
       call('sendTransaction', [b64, {encoding: 'base64', skipPreflight: false, maxRetries: 4}]),
       call('simulateTransaction', [b64, {encoding: 'base64', accounts: {addresses: Array(100).fill(treasury)}}]),
       call('getFeeForMessage', ['!'.repeat(1644)]), {...call('getGenesisHash'), id: null}, {...call('getGenesisHash'), jsonrpc: '1.0'},
@@ -99,6 +124,51 @@ try {
     assert.equal(result.status, 200); assert.equal((await bodyOf(result)).result, sig); assert.equal(sends, 1);
     assert.equal(result.headers.get('Cache-Control'), 'no-store');
     assert.equal(result.headers.get('Access-Control-Allow-Origin'), null);
+  });
+  await test('real browser SDK reproduces the old rejection and forwards signed v0 and legacy packets with preflight enabled', async () => {
+    const fixedGate = '(p[1].skipPreflight === undefined || p[1].skipPreflight === false)';
+    assert(source.includes(fixedGate), 'The counterfactual must restore the exact previous preflight validator');
+    const previousSource = source.replace(fixedGate, 'p[1].skipPreflight === false');
+    const previousWorker = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(previousSource)).toString('base64')}`);
+    let activeHandler = previousWorker.handleRequest, upstreamCalls = 0;
+    const outbound = [], forwarded = [];
+    const browser = await browserRpcClient(async (url, init) => {
+      assert.equal(url, `${site}/api/rpc`);
+      const headers = new Headers(init.headers);
+      headers.set('Origin', site); headers.set('Sec-Fetch-Site', 'same-origin');
+      headers.set('CF-Connecting-IP', '192.0.2.1');
+      outbound.push(JSON.parse(init.body));
+      return activeHandler(new Request(url, {...init, headers}), env());
+    });
+    globalThis.fetch = async (url, init) => {
+      upstreamCalls++; assert.equal(url, endpoint);
+      const call = JSON.parse(init.body); forwarded.push(call);
+      assert.equal(call.method, 'sendTransaction');
+      assert.equal(call.params[1].skipPreflight, false);
+      return reply(sig, call.id);
+    };
+    const payer = Keypair.generate(), destination = Keypair.generate().publicKey;
+    const message = new TransactionMessage({payerKey: payer.publicKey, recentBlockhash: Keypair.generate().publicKey.toBase58(), instructions: [SystemProgram.transfer({fromPubkey: payer.publicKey, toPubkey: destination, lamports: 1})]});
+    const signedPacket = version => {
+      const tx = new VersionedTransaction(version === 0 ? message.compileToV0Message() : message.compileToLegacyMessage());
+      tx.sign([payer]); return Uint8Array.from(tx.serialize());
+    };
+    const deploymentOptions = {skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3, minContextSlot: 100};
+    const connection = () => new browser.Connection(`${site}/api/rpc`, {commitment: 'confirmed', disableRetryOnRateLimit: true, fetch: browser.createDeploymentRpcFetch()});
+    const versioned = signedPacket(0);
+    await assert.rejects(connection().sendRawTransaction(versioned, deploymentOptions), /400|Unsupported RPC/);
+    assert.equal(upstreamCalls, 0, 'The old Worker discarded an actual SDK send before Helius');
+    assert.equal(Object.hasOwn(outbound[0].params[1], 'skipPreflight'), false, 'web3.js omits false despite the explicit caller option');
+    activeHandler = handleRequest;
+    assert.equal(await connection().sendRawTransaction(versioned, deploymentOptions), sig);
+    const legacy = signedPacket('legacy');
+    const purchaseOptions = {skipPreflight: false, preflightCommitment: 'confirmed', minContextSlot: 101, maxRetries: 3};
+    assert.equal(await connection().sendRawTransaction(legacy, purchaseOptions), sig);
+    assert.equal(upstreamCalls, 2);
+    for (const [index, packet] of [versioned, legacy].entries()) {
+      assert.deepEqual(Buffer.from(forwarded[index].params[0], 'base64'), Buffer.from(packet), 'Signed packet must be forwarded byte for byte');
+      assert.deepEqual(forwarded[index].params[1], {...outbound[index + 1].params[1], skipPreflight: false});
+    }
   });
   await test('does not follow upstream redirects or leak authentication errors', async () => {
     for (const status of [301, 302, 307, 401, 403, 429, 500]) {

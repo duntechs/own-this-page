@@ -2,7 +2,7 @@ import {useEffect, useRef, useState} from 'react';
 import {Connection} from '@solana/web3.js';
 import {ArrowLeft, ArrowUpRight, Check, CheckCircle2, ChevronRight, Copy, LoaderCircle, Pause, RefreshCw, ShieldCheck, Wallet} from 'lucide-react';
 import {boundedSolanaFetch, SOLANA_TREASURY} from '../lib/solana-client';
-import {createDeploymentRpcFetch} from '../lib/solana-deployment-fetch';
+import {createDeploymentRpcFetch, DeploymentRpcError} from '../lib/solana-deployment-fetch';
 import {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, type DeploymentEstimate, type DeploymentInspection, type DeploymentProgress, type DeploymentResult} from '../lib/solana-deploy';
 import {connectSolanaWallet, createVersionedSolanaDeploymentSigner, disconnectSolanaWallet, listSolanaWallets, onSolanaAccountChange, onSolanaWalletsChanged, type SolanaWallet, type SolanaWalletSession} from '../lib/solana-wallet';
 import {SolanaWalletCompatibilityError} from '../lib/solana-wallet-diagnostics';
@@ -32,7 +32,7 @@ export default function MarketplaceSetup() {
   const [result, setResult] = useState<DeploymentResult | null>(null);
   const [existingProgram, setExistingProgram] = useState('');
   const [error, setError] = useState('');
-  const [errorReport, setErrorReport] = useState<SolanaWalletCompatibilityError['report'] | DeploymentSimulationError['report'] | null>(null);
+  const [errorReport, setErrorReport] = useState<SolanaWalletCompatibilityError['report'] | DeploymentSimulationError['report'] | DeploymentRpcError['report'] | null>(null);
   const [errorReportOpen, setErrorReportOpen] = useState(false);
   const [errorReportCopyFailed, setErrorReportCopyFailed] = useState(false);
   const [notice, setNotice] = useState('');
@@ -121,7 +121,7 @@ export default function MarketplaceSetup() {
         if (caught instanceof DeploymentPausedError) setNotice(caught.message);
         else {
           setError(errorText(caught));
-          if (caught instanceof SolanaWalletCompatibilityError || caught instanceof DeploymentSimulationError) setErrorReport(caught.report);
+          if (caught instanceof SolanaWalletCompatibilityError || caught instanceof DeploymentSimulationError || caught instanceof DeploymentRpcError) setErrorReport(caught.report);
         }
       }
     } finally {
