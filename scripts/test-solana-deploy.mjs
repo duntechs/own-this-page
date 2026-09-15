@@ -178,6 +178,79 @@ await check('AlreadyProcessed on an approved retry keeps reconciling and never s
   } finally {Date.now=now;globalThis.setTimeout=timer;}
 });
 
+await check('temporary BlockhashNotFound retries the same approved packet until confirmation without repeating the wallet approval',async()=>{
+  for(const count of [1,5]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate(),send=f.rpc.sendRawTransaction,statuses=f.rpc.getSignatureStatuses;
+    if(count===5){
+      const saved=f.checkpoint(),buffer=Buffer.alloc(binary.length+37);buffer.writeUInt32LE(1,0);buffer[4]=1;payer.publicKey.toBuffer().copy(buffer,5);
+      f.accounts.set(saved.bufferId,info(buffer));saved.walletBatchSafe=true;f.storage.setItem([...f.saved.keys()][0],JSON.stringify(saved));
+    }
+    const now=Date.now,timer=globalThis.setTimeout;let elapsed=0,rejectedPacket=null,retried=false;const submitted=[];
+    Date.now=()=>now()+elapsed;globalThis.setTimeout=(fn,ms,...args)=>timer(fn,ms===1500?0:ms,...args);
+    try {
+      f.rpc.sendRawTransaction=async(bytes,options)=>{
+        const raw=Buffer.from(bytes).toString('base64');submitted.push(raw);
+        assert.equal(options.skipPreflight,false);assert.equal(options.preflightCommitment,'confirmed');
+        if(!rejectedPacket){rejectedPacket=raw;throw new DeploymentRpcError(200,-32002,{err:'BlockhashNotFound',unitsConsumed:0,contextSlot:null});}
+        if(raw===rejectedPacket){
+          retried=true;assert.equal(f.checkpoint().pending.length,1,'Only the still-unresolved packet is retried after group reconciliation');
+          assert.equal(f.checkpoint().pending[0].raw,rejectedPacket);assert.deepEqual(f.signedBatches,[count]);
+        }
+        return send(bytes,options);
+      };
+      f.rpc.getSignatureStatuses=async ids=>{if(!retried)elapsed=9000;return statuses(ids);};
+      f.onUpdate(p=>{if(p.stage==='uploading'&&(count===1?f.applied.some(a=>a.kind==='buffer-account'):f.applied.filter(a=>a.kind==='write').length===5))e.pause();});
+      await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+      assert.equal(retried,true);assert.equal(submitted.filter(raw=>raw===rejectedPacket).length,2);assert.equal(submitted.length,count+1);assert.deepEqual(f.signedBatches,[count]);assert.equal(f.checkpoint().pending.length,0);
+      const receipts=e.getDeploymentStatus().lastBatch.receipts,receipt=receipts.find(r=>r.attemptCount===2);
+      assert(receipts.every(r=>r.status==='confirmed'));assert.equal(receipt.rpcAcknowledged,true);assert.equal(receipt.lastAttempt,'acknowledged');
+      assert.deepEqual(receipt.lastRpcError,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:200,rpcCode:-32002,preflight:{err:'BlockhashNotFound',unitsConsumed:0,contextSlot:null}});
+    } finally {Date.now=now;globalThis.setTimeout=timer;}
+  }
+});
+
+await check('persistent BlockhashNotFound pauses only after finalized expiry with no replacement transaction or next wallet approval',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),statuses=f.rpc.getSignatureStatuses,packets=[];
+  const now=Date.now,timer=globalThis.setTimeout;let elapsed=0;
+  Date.now=()=>now()+elapsed;globalThis.setTimeout=(fn,ms,...args)=>timer(fn,ms===1500?0:ms,...args);
+  try {
+    f.rpc.sendRawTransaction=async(bytes,options)=>{
+      packets.push(Buffer.from(bytes).toString('base64'));assert.equal(options.skipPreflight,false);
+      if(packets.length===2)f.expire();
+      throw new DeploymentRpcError(200,-32002,{err:'BlockhashNotFound',unitsConsumed:0});
+    };
+    f.rpc.getSignatureStatuses=async ids=>{elapsed=9000;return statuses(ids);};
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/upload-account transaction expired/.test(error.message));
+    assert.equal(packets.length,2);assert.equal(packets[0],packets[1]);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.applied.length,0);assert.equal(f.checkpoint().pending.length,0);
+    const receipt=e.getDeploymentStatus().lastBatch.receipts[0];assert.equal(receipt.status,'expired');assert.equal(receipt.rpcAcknowledged,false);assert.equal(receipt.attemptCount,2);assert.equal(receipt.lastRpcError.preflight.err,'BlockhashNotFound');
+  } finally {Date.now=now;globalThis.setTimeout=timer;}
+});
+
+await check('BlockhashNotFound confirmation timeout retains the original signed receipt when finalized expiry is not established',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),statuses=f.rpc.getSignatureStatuses,height=f.rpc.getBlockHeight;let attempts=0,elapsed=0;
+  const now=Date.now,timer=globalThis.setTimeout;Date.now=()=>now()+elapsed;globalThis.setTimeout=(fn,ms,...args)=>timer(fn,ms===1500?0:ms,...args);
+  try {
+    f.rpc.sendRawTransaction=async()=>{attempts++;throw new DeploymentRpcError(200,-32002,{err:'BlockhashNotFound'});};
+    f.rpc.getSignatureStatuses=async ids=>{elapsed=90001;return statuses(ids);};
+    // The confirmed height forbids another broadcast, but finalized state is
+    // still behind expiry. A local timeout must not discard the receipt.
+    f.rpc.getBlockHeight=async options=>attempts?f.checkpoint().pending[0].lastValidBlockHeight+1:height(options);
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/Confirmation is still pending/.test(error.message));
+    assert.equal(attempts,1);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.checkpoint().pending.length,1);assert.equal(f.applied.length,0);
+    const receipt=e.getDeploymentStatus().lastBatch.receipts[0];assert.equal(receipt.status,'pending');assert.equal(receipt.rpcAcknowledged,false);assert.equal(receipt.lastRpcError.preflight.err,'BlockhashNotFound');
+  } finally {Date.now=now;globalThis.setTimeout=timer;}
+});
+
+await check('other preflight failures and non-200 BlockhashNotFound still surface immediately with all receipts preserved',async()=>{
+  for(const [status,code,error] of [[200,-32002,'InsufficientFundsForFee'],[200,-32002,{InstructionError:[2,{Custom:41}]}],[200,-32002,null],[502,-32002,'BlockhashNotFound'],[200,-32005,'BlockhashNotFound']]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate();let attempts=0;
+    f.rpc.getSignatureStatuses=()=>assert.fail('A terminal preflight error must surface before polling');
+    f.rpc.sendRawTransaction=async()=>{attempts++;throw new DeploymentRpcError(status,code,error?{err:error}:undefined);};
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentRpcError);
+    assert.equal(attempts,1);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.checkpoint().pending.length,1);assert.equal(f.applied.length,0);
+  }
+});
+
 await check('confirmed simulation contexts prevent later signed simulation and submission from using an older RPC bank',async()=>{
   const f=fixture(),e=f.fresh(),estimate=await e.estimate(),simulate=f.rpc.simulateTransaction,send=f.rpc.sendRawTransaction;
   let unsignedSlot=0,signedSlot=0;

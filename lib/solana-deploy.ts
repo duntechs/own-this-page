@@ -376,7 +376,7 @@ export class DeploymentEngine {
     const deadline = Date.now() + CONFIRM_MS;
     while (Date.now() < deadline) {
       if (await withSolanaTimeout(this.settlePending(), Math.max(1, deadline - Date.now()))) return;
-      const height = integer(await this.rpc(this.connection.getBlockHeight(COMMITMENT)), 'current block height');
+      const height = integer(await this.rpc(this.connection.getBlockHeight({commitment: COMMITMENT, minContextSlot: this.state!.minimumContextSlot})), 'current block height');
       if (Date.now() - lastBroadcast >= 8_000) {
         lastBroadcast = Date.now();
         // Only the already-approved signature is retried. A new blockhash is
@@ -412,6 +412,10 @@ export class DeploymentEngine {
       // AlreadyProcessed needs status reconciliation, not a new transaction or
       // an assumption of success. Every receipt stays pending until verified.
       if (outcome.reason.report.rpcCode === -32002 && outcome.reason.report.preflight?.err === 'AlreadyProcessed') continue;
+      // A pooled RPC can temporarily fail to recognize a still-valid hash.
+      // Keep reconciling/retrying this exact approved packet within its saved
+      // lifetime; this response neither confirms it nor establishes expiry.
+      if (outcome.reason.report.httpStatus === 200 && outcome.reason.report.rpcCode === -32002 && outcome.reason.report.preflight?.err === 'BlockhashNotFound') continue;
       throw outcome.reason;
     }
   }
