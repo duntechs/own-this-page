@@ -1,7 +1,7 @@
 {
   "network": "solana",
   "cluster": "mainnet-beta",
-  "rpc": "https://api.mainnet-beta.solana.com",
+  "rpc": "https://ownthispage.page/api/rpc",
   "devWallet": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
   "treasury": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
   "admin": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",

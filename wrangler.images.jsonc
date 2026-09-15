@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "own-this-page",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-15",
+  // Enable R2 in Cloudflare, then deploy with this configuration. Wrangler
+  // provisions a project-specific bucket and reuses its existing binding.
+  "r2_buckets": [{"binding": "IMAGES"}],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/media/*"]
+  },
+  // Add HELIUS_RPC_URL as a Worker runtime secret in Cloudflare. Never put it
+  // in this file, a VITE_ variable, or the public market configuration.
+  "ratelimits": [
+    {"name": "RPC_LIMIT", "namespace_id": "926153101", "simple": {"limit": 60, "period": 10}},
+    {"name": "RPC_SEND_LIMIT", "namespace_id": "926153102", "simple": {"limit": 10, "period": 10}},
+    {"name": "IMAGE_UPLOAD_LIMIT", "namespace_id": "926153103", "simple": {"limit": 5, "period": 60}}
+  ]
+}

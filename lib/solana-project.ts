@@ -55,7 +55,7 @@ export function isPublicHttpsRpc(value: unknown): value is string {
 export const solanaProject: Readonly<SolanaProjectConfig> = Object.freeze({
   network: 'solana',
   cluster: 'mainnet-beta',
-  rpc: 'https://api.mainnet-beta.solana.com',
+  rpc: 'https://ownthispage.page/api/rpc',
   devWallet: projectWallet,
   treasury: projectWallet,
   admin: projectWallet,

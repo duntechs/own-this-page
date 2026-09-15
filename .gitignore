@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 .preview-build/
 .sites-runtime/
@@ -8,6 +8,9 @@ solana-market/target/
 *.tsbuildinfo
 .env
 .env.*
+.dev.vars
+.dev.vars.*
+/public/deployment/
 *.log
 *-keypair.json
 

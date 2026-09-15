@@ -1,6 +1,6 @@
 import {Buffer} from 'buffer';
 import {getWallets} from '@wallet-standard/app';
-import {PublicKey, Transaction} from '@solana/web3.js';
+import {PublicKey, Transaction, VersionedTransaction} from '@solana/web3.js';
 import {buildSolanaTransaction, SLOT_ACCOUNT_SIZE, withSolanaTimeout, readSolanaSlots, sameSolanaQuote, verifySolanaProgram, type PreparedSolanaAction, type SolanaCluster} from './solana-client';
 
 type StandardWallet = ReturnType<ReturnType<typeof getWallets>['get']>[number];
@@ -132,6 +132,58 @@ export function createSolanaDeploymentSigner(session: SolanaWalletSession) {
     signTransactions,
     async signTransaction(transaction: Transaction): Promise<Transaction> {return (await signTransactions([transaction]))[0];},
   };
+}
+
+// Deployment uses frozen v0 messages and seeded accounts. The owner is the only
+// signer: no ephemeral account signatures need restoring or recompiling.
+export function createVersionedSolanaDeploymentSigner(session: SolanaWalletSession) {
+  async function signTransactions(transactions: VersionedTransaction[]): Promise<VersionedTransaction[]> {
+    const account = currentAccount(session);
+    if (!features(session.wallet).sign!.supportedTransactionVersions.includes(0)) throw Error('This wallet must support Solana version 0 transactions to deploy the marketplace.');
+    if (transactions.length < 1 || transactions.length > 5) throw Error('Review one to five deployment transactions at a time.');
+    const messages = transactions.map(transaction => {
+      if (transaction.version !== 0 || transaction.message.header.numRequiredSignatures !== 1 ||
+          transaction.message.staticAccountKeys[0].toBase58() !== account.address || transaction.message.addressTableLookups.length) {
+        throw Error('The deployment must use the connected wallet as its only signer.');
+      }
+      if (transaction.signatures.some(signature => signature.some(byte => byte !== 0))) throw Error('The deployment request already has a signature.');
+      return Uint8Array.from(transaction.message.serialize());
+    });
+    const output = await withSolanaTimeout(features(session.wallet).sign!.signTransaction(...transactions.map(transaction => ({
+      transaction: Uint8Array.from(transaction.serialize()), account, chain: chain(session.cluster),
+    }))), 90_000);
+    currentAccount(session);
+    if (output.length !== transactions.length) throw Error('The wallet returned an incomplete deployment batch. Nothing was submitted.');
+    const key = await crypto.subtle.importKey('raw', Uint8Array.from(account.publicKey), {name: 'Ed25519'}, false, ['verify']);
+    const signed = await Promise.all(output.map(async (item, index) => {
+      if (item.signedTransaction.length > 1232) throw Error('The wallet returned an oversized transaction.');
+      const transaction = VersionedTransaction.deserialize(item.signedTransaction);
+      if (transaction.version !== 0 || !Buffer.from(transaction.message.serialize()).equals(messages[index]) || transaction.signatures.length !== 1) {
+        throw Error('The wallet changed the deployment transaction. Nothing was submitted.');
+      }
+      if (!await crypto.subtle.verify({name: 'Ed25519'}, key, Uint8Array.from(transaction.signatures[0]), messages[index])) {
+        throw Error('The wallet did not return a valid deployment signature. Nothing was submitted.');
+      }
+      return transaction;
+    }));
+    currentAccount(session);
+    return signed;
+  }
+  return {publicKey: new PublicKey(session.account.address), assertCurrentAccount() {currentAccount(session);}, signTransactions};
+}
+
+export async function signSolanaImageUpload(session: SolanaWalletSession, message: Uint8Array): Promise<Uint8Array> {
+  const account = currentAccount(session);
+  const feature = session.wallet.features['solana:signMessage'] as {signMessage(...inputs: {account: StandardAccount; message: Uint8Array}[]): Promise<readonly {signedMessage: Uint8Array; signature: Uint8Array}[]>} | undefined;
+  if (!feature?.signMessage || !account.features.includes('solana:signMessage')) throw Error('This wallet does not support image upload authorization. You can use an existing image link instead.');
+  const expected = Uint8Array.from(message);
+  const output = await withSolanaTimeout(feature.signMessage({account, message: Uint8Array.from(expected)}), 90_000);
+  currentAccount(session);
+  if (output.length !== 1 || !Buffer.from(output[0].signedMessage).equals(expected) || output[0].signature.length !== 64) throw Error('The wallet changed the image upload authorization.');
+  const key = await crypto.subtle.importKey('raw', Uint8Array.from(account.publicKey), {name: 'Ed25519'}, false, ['verify']);
+  if (!await crypto.subtle.verify('Ed25519', key, Uint8Array.from(output[0].signature), expected)) throw Error('The image upload signature is invalid.');
+  currentAccount(session);
+  return Uint8Array.from(output[0].signature);
 }
 
 // Call only from an explicit confirmation click after displaying the prepared
