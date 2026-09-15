@@ -5,6 +5,7 @@ import {boundedSolanaFetch, SOLANA_TREASURY} from '../lib/solana-client';
 import {createDeploymentRpcFetch} from '../lib/solana-deployment-fetch';
 import {DeploymentEngine, DeploymentPausedError, type DeploymentEstimate, type DeploymentInspection, type DeploymentProgress, type DeploymentResult} from '../lib/solana-deploy';
 import {connectSolanaWallet, createVersionedSolanaDeploymentSigner, disconnectSolanaWallet, listSolanaWallets, onSolanaAccountChange, onSolanaWalletsChanged, type SolanaWallet, type SolanaWalletSession} from '../lib/solana-wallet';
+import {SolanaWalletCompatibilityError} from '../lib/solana-wallet-diagnostics';
 import '../marketplace-setup.css';
 
 type Operation = 'checking' | 'connecting' | 'estimating' | 'deploying' | 'verifying' | null;
@@ -31,8 +32,11 @@ export default function MarketplaceSetup() {
   const [result, setResult] = useState<DeploymentResult | null>(null);
   const [existingProgram, setExistingProgram] = useState('');
   const [error, setError] = useState('');
+  const [errorReport, setErrorReport] = useState<SolanaWalletCompatibilityError['report'] | null>(null);
+  const [errorReportOpen, setErrorReportOpen] = useState(false);
+  const [errorReportCopyFailed, setErrorReportCopyFailed] = useState(false);
   const [notice, setNotice] = useState('');
-  const [copied, setCopied] = useState<'address' | 'report' | null>(null);
+  const [copied, setCopied] = useState<'address' | 'report' | 'error' | null>(null);
   const [pauseRequested, setPauseRequested] = useState(false);
   const engineRef = useRef<DeploymentEngine | null>(null);
   const pauseRequestedRef = useRef(false);
@@ -48,6 +52,11 @@ export default function MarketplaceSetup() {
   const total = progress?.totalBytes ?? inspection?.totalBytes ?? 1;
   // Upload completion is separate from the final on-chain verification.
   const percent = result ? 100 : Math.min(99, Math.floor(written / Math.max(total, 1) * 100));
+
+  function clearErrorReport() {
+    setErrorReport(null); setErrorReportOpen(false); setErrorReportCopyFailed(false);
+    setCopied(previous => previous === 'error' ? null : previous);
+  }
 
   async function checkHealth() {
     if (mounted.current) {setHealth('checking'); setHealthMessage('Checking the website’s Solana connection.');}
@@ -97,7 +106,7 @@ export default function MarketplaceSetup() {
   async function exclusive(kind: Exclude<Operation, 'connecting' | null>, action: (engine: DeploymentEngine) => Promise<void>) {
     if (busyRef.current) return;
     busyRef.current = true;
-    setOperation(kind); setError(''); setNotice('');
+    setOperation(kind); setError(''); setNotice(''); clearErrorReport();
     try {
       if (!navigator.locks) throw Error('This browser cannot protect a deployment across tabs. Open the site over HTTPS in a current desktop browser before continuing.');
       await navigator.locks.request('own-this-page-deployment', {ifAvailable: true}, async lock => {
@@ -110,7 +119,10 @@ export default function MarketplaceSetup() {
     } catch (caught) {
       if (mounted.current) {
         if (caught instanceof DeploymentPausedError) setNotice(caught.message);
-        else setError(errorText(caught));
+        else {
+          setError(errorText(caught));
+          if (caught instanceof SolanaWalletCompatibilityError) setErrorReport(caught.report);
+        }
       }
     } finally {
       busyRef.current = false;
@@ -147,6 +159,7 @@ export default function MarketplaceSetup() {
       if (next?.account.address === session.account.address && next.cluster === session.cluster) return;
       engineRef.current?.pause(); sessionRef.current = null;
       setSession(null); setAccepted(false); setEstimate(null);
+      clearErrorReport();
       setError('The connected account changed or disconnected. Deployment has been asked to pause. Reconnect the approved owner wallet to continue.');
     });
   }, [session]);
@@ -166,7 +179,7 @@ export default function MarketplaceSetup() {
 
   async function connect(wallet: SolanaWallet) {
     if (busyRef.current) return;
-    busyRef.current = true; setOperation('connecting'); setError(''); setAccepted(false); setEstimate(null);
+    busyRef.current = true; setOperation('connecting'); setError(''); setAccepted(false); setEstimate(null); clearErrorReport();
     try {
       const next = await connectSolanaWallet(wallet, 'mainnet-beta');
       if (!mounted.current) return;
@@ -179,6 +192,7 @@ export default function MarketplaceSetup() {
   async function disconnect() {
     if (busyRef.current || !session) return;
     const previous = session;
+    clearErrorReport();
     sessionRef.current = null; setSession(null); setAccepted(false); setEstimate(null);
     try {await disconnectSolanaWallet(previous);} catch (caught) {if (mounted.current) setError(errorText(caught));}
   }
@@ -231,6 +245,17 @@ export default function MarketplaceSetup() {
     try {await navigator.clipboard.writeText(value); setCopied(kind);} catch {setError('Clipboard access was blocked. Select and copy the program address shown below.');}
   }
 
+  async function copyErrorReport() {
+    if (!errorReport) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(errorReport, null, 2));
+      setCopied('error'); setErrorReportCopyFailed(false);
+    } catch {
+      setCopied(previous => previous === 'error' ? null : previous);
+      setErrorReportCopyFailed(true); setErrorReportOpen(true);
+    }
+  }
+
   return <div className="marketplace-setup">
     <header className="mp-header"><a className="mp-brand" href="/"><img src="/brand/own-this-page-logo.png" alt=""/><span>Own This Page</span></a><a className="mp-back" href="/"><ArrowLeft size={15}/><span>Back to the page</span></a></header>
     <main className="mp-layout">
@@ -254,7 +279,7 @@ export default function MarketplaceSetup() {
           {(progress || hasSavedDeployment) && <div className="mp-progress" role="status" aria-live="polite"><div className="mp-progress-heading"><strong>{operation === 'deploying' ? 'Deployment in progress' : inspection?.stage === 'pending' ? 'Checking your saved deployment' : 'Saved deployment'}</strong><span>{percent}%</span></div><progress value={percent} max={100} aria-label="Marketplace deployment progress"/><p>{progress?.message ?? (inspection?.pendingTransactions ? 'Saved transactions will be checked before any new signatures are requested.' : 'Your saved upload will be checked before resuming.')}</p><div className="mp-progress-actions">{operation === 'deploying' && <button type="button" className="mp-button mp-button-secondary" disabled={pauseRequested} onClick={() => {pauseRequestedRef.current = true; engineRef.current?.pause(); setPauseRequested(true);}}><Pause size={13}/>{pauseRequested ? 'Pausing after current batch…' : 'Pause after current batch'}</button>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Latest transaction<ArrowUpRight size={13}/></a>}{!busy && <button type="button" className="mp-text-button" onClick={() => void inspect()}>Check saved progress</button>}</div><p className="mp-keep-open">Keep this tab open during upload. If interrupted, return to this same browser and domain, then check the remaining cost to resume. Do not clear this site’s saved data.</p></div>}
         </section>}
 
-        {error && <div className="mp-error" role="alert"><strong>This step could not finish.</strong><p>{error}</p>{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Check the latest transaction<ArrowUpRight size={13}/></a>}</div>}
+        {error && <div className="mp-error" role="alert"><strong>{errorReport ? 'Wallet signing issue.' : 'This step could not finish.'}</strong><p>{error}</p>{errorReport && <div className="mp-error-report"><p>Share this report here so the signing issue can be checked.</p><button type="button" className="mp-button mp-button-secondary" onClick={() => void copyErrorReport()}>{copied === 'error' ? <Check size={15}/> : <Copy size={15}/ >}{copied === 'error' ? 'Error report copied — paste it in chat' : 'Copy error report'}</button>{errorReportCopyFailed && <p role="status" className="mp-error-report-help">Clipboard access was blocked. Select and copy the report below.</p>}<details open={errorReportOpen} onToggle={event => setErrorReportOpen(event.currentTarget.open)}><summary>View error report</summary><label htmlFor="mp-wallet-error-report">Signing diagnostic report</label><textarea id="mp-wallet-error-report" readOnly value={JSON.stringify(errorReport, null, 2)} onFocus={event => event.currentTarget.select()} spellCheck={false}/></details></div>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Check the latest transaction<ArrowUpRight size={13}/></a>}</div>}
         {notice && <div className="mp-notice" role="status">{notice}</div>}
 
         {result && <section className="mp-card mp-success" aria-labelledby="mp-result-heading"><div className="mp-success-icon"><CheckCircle2 size={27}/></div><span className="mp-eyebrow">PROGRAM VERIFIED</span><h2 id="mp-result-heading">The marketplace is deployed.</h2><p>The on-chain program code, Solana network, and owner authority match this project.</p><label className="mp-address-label" htmlFor="mp-program-result">Marketplace program address</label><div className="mp-result-address"><input id="mp-program-result" value={result.programId} readOnly onFocus={event => event.currentTarget.select()}/><button type="button" onClick={() => void copy('address')} aria-label="Copy marketplace program address">{copied === 'address' ? <Check size={17}/> : <Copy size={17}/>}</button></div><a className="mp-explorer" href={explorer('account', result.programId)} target="_blank" rel="noopener noreferrer">View program on Solscan<ArrowUpRight size={13}/></a><div className="mp-next-step"><h3>Next: verify a real purchase</h3><p>Public purchases are still off. Copy the public deployment report and paste it in your project chat. The next step is a controlled purchase, edit, and takeover check, including the treasury receipt, before opening the market.</p></div><button type="button" className="mp-button mp-button-primary" onClick={() => void copy('report')}>{copied === 'report' ? <Check size={16}/> : <Copy size={16}/ >}{copied === 'report' ? 'Report copied — paste it in chat' : 'Copy public deployment report'}</button><p className="mp-report-note">The report contains public addresses and program details. It contains no wallet keys or RPC credentials.</p></section>}

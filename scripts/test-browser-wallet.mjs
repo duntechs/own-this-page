@@ -5,15 +5,17 @@ import path from 'node:path';
 import vm from 'node:vm';
 import {createPrivateKey, sign} from 'node:crypto';
 import {build} from 'vite';
-import {Keypair, VersionedTransaction} from '@solana/web3.js';
+import {ComputeBudgetProgram, Keypair, PublicKey, TransactionMessage, VersionedTransaction} from '@solana/web3.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const payer = Keypair.generate();
+const fixedOwner = '8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9';
 const privateKey = createPrivateKey({key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(payer.secretKey.subarray(0, 32))]), format: 'der', type: 'pkcs8'});
 const virtualEntry = path.join(root, '.sites-runtime/browser-wallet-regression.ts');
 const entry = `
   export {Buffer as BrowserBuffer} from 'buffer';
   export {connectSolanaWallet, createVersionedSolanaDeploymentSigner, signSolanaImageUpload} from ${JSON.stringify(path.join(root, 'lib/solana-wallet.ts'))};
+  export {DeploymentEngine} from ${JSON.stringify(path.join(root, 'lib/solana-deploy.ts'))};
   import {PublicKey, SystemProgram, TransactionMessage, VersionedTransaction} from '@solana/web3.js';
   export function unsignedTransaction(payer, destination, blockhash) {
     const fromPubkey = new PublicKey(payer), toPubkey = new PublicKey(destination);
@@ -30,6 +32,9 @@ async function browserBundle(oldComparisons = false) {
       resolveId(id) {if (id === virtualEntry) return '\0' + virtualEntry;},
       load(id) {if (id === '\0' + virtualEntry) return entry;},
       transform(code, id) {
+        // Generated identity only in this isolated bundle. The production
+        // owner and immutable program binary are never changed.
+        if (id.endsWith('/lib/solana-client.ts')) return code.replaceAll(fixedOwner, payer.publicKey.toBase58());
         if (!oldComparisons || !id.endsWith('/lib/solana-wallet.ts')) return;
         const old = code
           .replace('Buffer.from(transaction.message.serialize()).equals(Buffer.from(messages[index]))', 'Buffer.from(transaction.message.serialize()).equals(messages[index])')
@@ -59,13 +64,40 @@ async function browserBundle(oldComparisons = false) {
 
 function wallet(mode) {
   const account = {address: payer.publicKey.toBase58(), publicKey: payer.publicKey.toBytes(), chains: ['solana:mainnet'], features: ['solana:signTransaction', 'solana:signMessage']};
-  const fixture = {version: '1.0.0', name: 'Isolated browser test wallet', icon: 'data:image/png;base64,', accounts: [account], chains: ['solana:mainnet'], features: {
+  const fixture = {signingCalls: 0, version: '1.0.0', name: 'Isolated browser test wallet', icon: 'data:image/png;base64,', accounts: [account], chains: ['solana:mainnet'], features: {
     'standard:connect': {connect: async () => ({accounts: fixture.accounts})},
     'standard:events': {on: () => () => {}},
     'solana:signTransaction': {supportedTransactionVersions: ['legacy', 0], async signTransaction(...inputs) {
+      fixture.signingCalls++;
       return inputs.map(input => {
-        const tx = VersionedTransaction.deserialize(input.transaction);
+        let tx = VersionedTransaction.deserialize(input.transaction);
+        if (mode === 'v1-conversion') {
+          // The installed SDK reads v1 but intentionally cannot serialize it.
+          // Encode the documented wire layout only to test diagnostic handling
+          // of that unsupported output; it must never become acceptable input.
+          const m = tx.message, h = m.header, instructions = m.compiledInstructions;
+          const message = Buffer.concat([
+            Buffer.from([0x81, h.numRequiredSignatures, h.numReadonlySignedAccounts, h.numReadonlyUnsignedAccounts, 0, 0, 0, 0]),
+            new PublicKey(m.recentBlockhash).toBuffer(), Buffer.from([instructions.length, m.staticAccountKeys.length]),
+            ...m.staticAccountKeys.map(key => key.toBuffer()),
+            ...instructions.map(ix => Buffer.from([ix.programIdIndex, ix.accountKeyIndexes.length, ix.data.length & 255, ix.data.length >> 8])),
+            ...instructions.map(ix => Buffer.concat([Buffer.from(ix.accountKeyIndexes), Buffer.from(ix.data)])),
+          ]);
+          return {signedTransaction: Uint8Array.from(Buffer.concat([message, sign(null, message, privateKey)]))};
+        }
         if (mode === 'changed-transaction') tx.message.recentBlockhash = Keypair.generate().publicKey.toBase58();
+        if (mode === 'legacy-conversion') tx = new VersionedTransaction(TransactionMessage.decompile(tx.message).compileToLegacyMessage());
+        if (mode === 'changed-priority') tx.message.compiledInstructions[1].data = ComputeBudgetProgram.setComputeUnitPrice({microLamports: 24000}).data;
+        if (mode === 'changed-limit') tx.message.compiledInstructions[0].data = ComputeBudgetProgram.setComputeUnitLimit({units: 300000}).data;
+        if (mode === 'changed-instruction') tx.message.compiledInstructions[2].data[tx.message.compiledInstructions[2].data.length - 1] ^= 1;
+        if (mode === 'changed-account-order') {
+          const keys = tx.message.staticAccountKeys;
+          [keys[keys.length - 1], keys[keys.length - 2]] = [keys[keys.length - 2], keys[keys.length - 1]];
+        }
+        if (mode === 'extra-signer') {
+          tx.message.header.numRequiredSignatures = 2;
+          tx.signatures = [new Uint8Array(64), new Uint8Array(64)];
+        }
         tx.sign([payer]);
         if (mode === 'invalid-transaction-signature') tx.signatures[0][0] ^= 1;
         return {signedTransaction: Uint8Array.from(tx.serialize())};
@@ -83,6 +115,42 @@ function wallet(mode) {
 }
 function transactions(api) {
   return Array.from({length: 5}, () => api.unsignedTransaction(payer.publicKey.toBase58(), Keypair.generate().publicKey.toBase58(), Keypair.generate().publicKey.toBase58()));
+}
+
+// Capture the actual first transaction created by the browser deployment
+// engine. Mock only its RPC state and intercept BEFORE signing or sending.
+// This exercises seeded-account construction and SDK browser serialization,
+// rather than recreating the implementation in a test-only transaction.
+async function firstDeploymentTransaction(api) {
+  const saved = new Map();
+  const stop = Error('Captured without signing');
+  let captured;
+  const connection = {
+    async getGenesisHash() {return '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';},
+    async getAccountInfoAndContext() {return {context: {slot: 100}, value: null};},
+    async getMinimumBalanceForRentExemption(size) {return size * 8 + 1000;},
+    async getLatestBlockhash() {return {blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 260};},
+    async getFeeForMessage() {return {context: {slot: 100}, value: 5000};},
+    async getBalance() {return 100_000_000_000;},
+    async getRecentPrioritizationFees() {return [{prioritizationFee: 10000}];},
+    async simulateTransaction() {return {context: {slot: 100}, value: {err: null}};},
+    async sendRawTransaction() {assert.fail('The browser fixture must never broadcast');},
+  };
+  const engine = new api.DeploymentEngine({connection,
+    binary: Uint8Array.from(await readFile(path.join(root, 'solana-market/artifacts/slot_market.so'))),
+    storage: {getItem: key => saved.get(key) ?? null, setItem: (key, value) => saved.set(key, value)},
+  });
+  const estimate = await engine.estimate();
+  await assert.rejects(engine.run({publicKey: payer.publicKey, assertCurrentAccount() {}, async signTransactions(input) {
+    assert.equal(input.length, 1); captured = input[0]; throw stop;
+  }}, estimate.requiredLamports), error => error === stop);
+  assert(captured, 'The real browser engine must reach the first wallet approval');
+  const decoded = TransactionMessage.decompile(captured.message);
+  assert.equal(decoded.instructions.length, 4);
+  assert.equal(decoded.instructions[0].programId.toBase58(), ComputeBudgetProgram.programId.toBase58());
+  assert.equal(decoded.instructions[3].programId.toBase58(), 'BPFLoaderUpgradeab1e11111111111111111111111');
+  assert.equal(JSON.parse([...saved.values()][0]).pending.length, 0);
+  return captured;
 }
 const imageMessage = new TextEncoder().encode(`Own This Page image upload\nOrigin: https://ownpage.example\nWallet: ${payer.publicKey.toBase58()}\nSHA-256: ${'a'.repeat(64)}\nTime: 1800000000`);
 let passed = 0;
@@ -109,7 +177,7 @@ await check('fixed browser bundle accepts five exact versioned transactions and 
 await check('fixed browser bundle still rejects changed transaction messages and invalid signatures', async () => {
   for (const mode of ['changed-transaction', 'invalid-transaction-signature']) {
     const signer = current.createVersionedSolanaDeploymentSigner(await current.connectSolanaWallet(wallet(mode)));
-    await assert.rejects(signer.signTransactions(transactions(current)), /changed the deployment transaction|valid deployment signature/);
+    await assert.rejects(signer.signTransactions(transactions(current)), /changed the deployment transaction|different transaction|valid deployment signature/);
   }
 });
 await check('fixed browser bundle accepts the exact image authorization and verifies its signature', async () => {
@@ -118,5 +186,47 @@ await check('fixed browser bundle accepts the exact image authorization and veri
 });
 await check('fixed browser bundle still rejects changed image authorization and invalid signatures', async () => {
   for (const mode of ['changed-image', 'invalid-image-signature']) await assert.rejects(current.signSolanaImageUpload(await current.connectSolanaWallet(wallet(mode)), imageMessage), /changed the image upload authorization|signature is invalid/);
+});
+const first = await firstDeploymentTransaction(current);
+await check('actual browser-engine seeded upload-account transaction survives exact wallet signing', async () => {
+  const signer = current.createVersionedSolanaDeploymentSigner(await current.connectSolanaWallet(wallet()));
+  const [signed] = await signer.signTransactions([first]);
+  assert.deepEqual(Uint8Array.from(signed.message.serialize()), Uint8Array.from(first.message.serialize()));
+  assert(first.signatures[0].every(byte => byte === 0));
+});
+await check('actual deployment transaction changes are rejected with a shareable report and no signed packets', async () => {
+  for (const mode of ['changed-transaction', 'legacy-conversion', 'v1-conversion', 'changed-priority', 'changed-limit', 'changed-instruction', 'changed-account-order', 'extra-signer']) {
+    const signer = current.createVersionedSolanaDeploymentSigner(await current.connectSolanaWallet(wallet(mode)));
+    await assert.rejects(signer.signTransactions([first]), error => {
+      assert.equal(error.name, 'SolanaWalletCompatibilityError', mode);
+      assert.equal(error.report.diagnosticVersion, 'otp-wallet-1');
+      const detail = error.report;
+      assert.equal(detail.expected.version, 0); assert.equal(detail.matches.message, false);
+      assert.equal(detail.expected.signatureCount, 1);
+      assert.equal(detail.expected.instructionCount, 4);
+      if (mode === 'changed-transaction') {assert.equal(detail.matches.blockhash, false); assert.equal(detail.matches.instructions, true);}
+      if (mode === 'legacy-conversion') {assert.equal(detail.returned.version, 'legacy'); assert.equal(detail.matches.instructions, true);}
+      if (mode === 'v1-conversion') assert.equal(detail.returned.version, 1);
+      if (mode === 'changed-priority') {assert.equal(detail.instructions[1].dataEqual, false); assert.equal(detail.instructions[1].returnedCompute.priceMicroLamports, '24000');}
+      if (mode === 'changed-limit') {assert.equal(detail.instructions[0].dataEqual, false); assert.equal(detail.instructions[0].returnedCompute.limit, 300000);}
+      if (mode === 'changed-instruction') {assert.equal(detail.instructions[2].dataEqual, false); assert.equal(detail.matches.blockhash, true);}
+      if (mode === 'changed-account-order') assert.equal(detail.matches.accountOrder, false);
+      if (mode === 'extra-signer') {assert.equal(detail.returned.signatureCount, 2); assert.equal(detail.matches.header, false);}
+      const report = JSON.stringify(error.report);
+      for (const secret of [payer.publicKey.toBase58(), Buffer.from(first.serialize()).toString('base64'), first.message.recentBlockhash]) {
+        assert(!report.includes(secret), 'Report must contain comparisons, not wallet addresses or transaction bytes');
+      }
+      assert(!/signedTransaction|privateKey|secretKey|api-key/.test(report));
+      return true;
+    });
+  }
+});
+await check('local encoding inconsistency stops before a wallet prompt', async () => {
+  const fixture = wallet(), signer = current.createVersionedSolanaDeploymentSigner(await current.connectSolanaWallet(fixture));
+  const input = transactions(current)[0], changed = VersionedTransaction.deserialize(input.serialize());
+  changed.message.recentBlockhash = Keypair.generate().publicKey.toBase58();
+  input.serialize = () => Uint8Array.from(changed.serialize());
+  await assert.rejects(signer.signTransactions([input]), /encoded consistently/);
+  assert.equal(fixture.signingCalls, 0);
 });
 console.log(`Browser wallet regression: ${passed} checks passed using Vite's browser bundle and strict Buffer polyfill. No live wallet or network used.`);

@@ -2,6 +2,7 @@ import {Buffer} from 'buffer';
 import {getWallets} from '@wallet-standard/app';
 import {PublicKey, Transaction, VersionedTransaction} from '@solana/web3.js';
 import {buildSolanaTransaction, SLOT_ACCOUNT_SIZE, withSolanaTimeout, readSolanaSlots, sameSolanaQuote, verifySolanaProgram, type PreparedSolanaAction, type SolanaCluster} from './solana-client';
+import {createSolanaWalletCompatibilityReport, SolanaWalletCompatibilityError} from './solana-wallet-diagnostics';
 
 type StandardWallet = ReturnType<ReturnType<typeof getWallets>['get']>[number];
 type StandardAccount = StandardWallet['accounts'][number];
@@ -149,8 +150,16 @@ export function createVersionedSolanaDeploymentSigner(session: SolanaWalletSessi
       if (transaction.signatures.some(signature => signature.some(byte => byte !== 0))) throw Error('The deployment request already has a signature.');
       return Uint8Array.from(transaction.message.serialize());
     });
-    const output = await withSolanaTimeout(features(session.wallet).sign!.signTransaction(...transactions.map(transaction => ({
-      transaction: Uint8Array.from(transaction.serialize()), account, chain: chain(session.cluster),
+    const packets = transactions.map((transaction, index) => {
+      const packet = Uint8Array.from(transaction.serialize());
+      const roundTrip = VersionedTransaction.deserialize(packet);
+      if (roundTrip.version !== 0 || roundTrip.signatures.length !== 1 || !Buffer.from(roundTrip.message.serialize()).equals(Buffer.from(messages[index])) || roundTrip.signatures.some(signature => signature.some(byte => byte !== 0))) {
+        throw Error('The deployment transaction could not be encoded consistently. No wallet approval was requested.');
+      }
+      return packet;
+    });
+    const output = await withSolanaTimeout(features(session.wallet).sign!.signTransaction(...packets.map(transaction => ({
+      transaction, account, chain: chain(session.cluster),
     }))), 90_000);
     currentAccount(session);
     if (output.length !== transactions.length) throw Error('The wallet returned an incomplete deployment batch. Nothing was submitted.');
@@ -161,7 +170,8 @@ export function createVersionedSolanaDeploymentSigner(session: SolanaWalletSessi
       // The browser Buffer polyfill requires both operands to be Buffers.
       // Node also accepts Uint8Array, so SSR tests alone miss this boundary.
       if (transaction.version !== 0 || !Buffer.from(transaction.message.serialize()).equals(Buffer.from(messages[index])) || transaction.signatures.length !== 1) {
-        throw Error('The wallet changed the deployment transaction. Nothing was submitted.');
+        throw new SolanaWalletCompatibilityError(createSolanaWalletCompatibilityReport({walletName: session.wallet.name, batchIndex: index, batchCount: transactions.length,
+          expectedMessage: messages[index], returnedTransaction: transaction, returnedPacket: item.signedTransaction}));
       }
       if (!await crypto.subtle.verify({name: 'Ed25519'}, key, Uint8Array.from(transaction.signatures[0]), messages[index])) {
         throw Error('The wallet did not return a valid deployment signature. Nothing was submitted.');
