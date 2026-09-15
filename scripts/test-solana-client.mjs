@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import path from 'node:path';
 import {build} from 'vite';
-import {ComputeBudgetProgram, ComputeBudgetInstruction, Keypair, PublicKey, SystemProgram, Transaction} from '@solana/web3.js';
+import {ComputeBudgetProgram, ComputeBudgetInstruction, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction, VersionedTransaction} from '@solana/web3.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const output = path.join(root, '.sites-runtime/solana-client-tests');
@@ -19,6 +19,11 @@ const other = Keypair.generate();
 assert.equal(SOLANA_TREASURY, '8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9');
 const treasury = new PublicKey(SOLANA_TREASURY);
 const loader = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+const lighthouse = new PublicKey('L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95');
+const walletAssertion = () => new TransactionInstruction({programId:lighthouse,keys:[{pubkey:buyer.publicKey,isSigner:false,isWritable:false}],data:Buffer.from([5,0,0,0,0,0,0,0,0,0,0,4])});
+function addWalletAssertions(transaction) {
+  transaction.instructions=[...transaction.instructions.slice(0,2),walletAssertion(),...transaction.instructions.slice(2),walletAssertion(),walletAssertion()];
+}
 const binary = Buffer.alloc(64, 42);
 const programSha256 = createHash('sha256').update(binary).digest('hex');
 const config = {cluster: 'mainnet-beta', rpc: 'https://rpc.example.com/', programId: programId.toBase58(), programSha256, programLength: binary.length};
@@ -372,6 +377,79 @@ await check('market submission sends once, uses preflight, and confirms the same
   const {market} = mockMarket({async sendRawTransaction(bytes, options) {sends++; assert.equal(options.skipPreflight, false); assert.equal(options.maxRetries, 3); assert(Transaction.from(bytes).verifySignatures()); sentSignature = encodeSolanaSignature(Transaction.from(bytes).signature); return sentSignature;}, async getSignatureStatuses(signatures) {assert.deepEqual(signatures, [sentSignature]); return {value: [{err: null, confirmationStatus: 'confirmed'}]};}});
   const prepared = await prepareSolanaAction(market, basic());
   assert.equal(await signAndSendSolanaTransaction(session, prepared), sentSignature); assert.equal(sends, 1);
+});
+
+await check('guarded legacy purchase verifies and simulates the complete signed packet before receipt and broadcast',async()=>{
+  let sentSignature,saved,sentPacket,signedSimulation;
+  const mock=fakeWallet(buyer,addWalletAssertions),session=await connectSolanaWallet(mock.wallet);
+  const {market}=mockMarket({
+    async simulateTransaction(transaction,options){
+      assert(transaction instanceof VersionedTransaction);assert.equal(options.replaceRecentBlockhash,false);
+      if(options.sigVerify){
+        assert.equal(transaction.version,'legacy');assert(transaction.signatures[0].some(byte=>byte!==0));
+        const decoded=Transaction.from(transaction.serialize());assert(decoded.verifySignatures());
+        assert.equal(decoded.instructions.filter(ix=>ix.programId.equals(lighthouse)).length,3);
+        signedSimulation=Buffer.from(transaction.serialize());
+      }
+      return {context:{slot:101},value:{err:null}};
+    },
+    async sendRawTransaction(bytes,options){
+      assert(saved,'A signed receipt must be persisted before the guarded purchase is broadcast');
+      assert(signedSimulation,'Actual returned bytes must pass signed simulation before broadcast');
+      assert.deepEqual(Buffer.from(bytes),signedSimulation,'The guards must remain in exactly the simulated signed packet');
+      assert.equal(options.skipPreflight,false);sentPacket=Transaction.from(bytes);assert(sentPacket.verifySignatures());
+      sentSignature=encodeSolanaSignature(sentPacket.signature);assert.equal(saved.signature,sentSignature);return sentSignature;
+    },
+    async getSignatureStatuses(ids){assert.deepEqual(ids,[sentSignature]);return {value:[{err:null,confirmationStatus:'confirmed'}]};},
+  });
+  const prepared=await prepareSolanaAction(market,basic()),operation=prepared.transaction.instructions.at(-1);
+  assert.equal(await signAndSendSolanaTransaction(session,prepared,60_000,receipt=>{saved=receipt;}),sentSignature);
+  assert.equal(sentPacket.instructions.length,6);
+  const sentOperation=sentPacket.instructions.find(ix=>ix.programId.equals(programId));
+  assert.deepEqual(sentOperation.data,operation.data);
+  assert.deepEqual(sentOperation.keys.map(key=>key.pubkey.toBase58()),operation.keys.map(key=>key.pubkey.toBase58()));
+  assert.equal(saved.actor,buyer.publicKey.toBase58());assert.equal(saved.programId,programId.toBase58());
+});
+
+await check('guarded purchase still rejects changed payments and unsupported wallet instructions',async()=>{
+  for(const mode of ['payment','unknown-guard']){
+    let sends=0,saves=0;
+    const mock=fakeWallet(buyer,transaction=>{
+      addWalletAssertions(transaction);
+      if(mode==='payment')transaction.instructions.find(ix=>ix.programId.equals(programId)).data[51]^=1;
+      else transaction.instructions.find(ix=>ix.programId.equals(lighthouse)).data[0]=0;
+    });
+    const {market}=mockMarket({async sendRawTransaction(){sends++;throw Error('Unexpected broadcast');}});
+    const prepared=await prepareSolanaAction(market,basic()),session=await connectSolanaWallet(mock.wallet);
+    await assert.rejects(()=>signAndSendSolanaTransaction(session,prepared,60_000,()=>{saves++;}),/changed/);
+    assert.equal(sends,0);assert.equal(saves,0);assert.equal(mock.calls(),2);
+  }
+});
+
+await check('post-wallet guarded fee, simulation and account checks reject before saving or sending a purchase',async()=>{
+  for(const mode of ['fee','simulation','account']){
+    let sends=0,saves=0,signedSimulations=0;
+    const mock=fakeWallet(buyer,addWalletAssertions),session=await connectSolanaWallet(mock.wallet);
+    const {market}=mockMarket({
+      async getFeeForMessage(message){
+        const keys=message.staticAccountKeys??message.accountKeys;
+        return {context:{slot:101},value:mode==='fee'&&keys.some(key=>key.equals(lighthouse))?7401:7400};
+      },
+      async simulateTransaction(transaction,options){
+        if(options.sigVerify){
+          signedSimulations++;assert(transaction.signatures[0].some(byte=>byte!==0));
+          if(mode==='account')mock.change([]);
+          if(mode==='simulation')return {context:{slot:101},value:{err:{InstructionError:[2,'Custom']}}};
+        }
+        return {context:{slot:101},value:{err:null}};
+      },
+      async sendRawTransaction(){sends++;throw Error('Unexpected broadcast');},
+    });
+    const prepared=await prepareSolanaAction(market,basic());
+    await assert.rejects(()=>signAndSendSolanaTransaction(session,prepared,60_000,()=>{saves++;}),/fee|simulation|simulated|account changed|disconnected/);
+    assert.equal(mock.calls(),2);assert.equal(sends,0);assert.equal(saves,0);
+    assert.equal(signedSimulations,mode==='fee'?0:1);
+  }
 });
 
 await check('wallet mutation never sends; ambiguous confirmations retain the receipt and never retry', async () => {

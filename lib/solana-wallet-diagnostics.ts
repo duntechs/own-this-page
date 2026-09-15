@@ -20,7 +20,7 @@ export type SolanaWalletCompatibilityReport = {
   returned: MessageSummary;
   firstDifferentByte: number | null;
   matches: {message: boolean; blockhash: boolean; payer: boolean; accountOrder: boolean; header: boolean; instructions: boolean; lookups: boolean};
-  instructions: {index: number; expectedCategory: ProgramCategory | null; returnedCategory: ProgramCategory | null; programEqual: boolean; dataEqual: boolean; accountsEqual: boolean; expectedCompute: ComputeValues | null; returnedCompute: ComputeValues | null}[];
+  instructions: {index: number; expectedCategory: ProgramCategory | null; returnedCategory: ProgramCategory | null; expectedProgram: string | null; returnedProgram: string | null; returnedDiscriminator: number | null; programEqual: boolean; dataEqual: boolean; accountsEqual: boolean; expectedCompute: ComputeValues | null; returnedCompute: ComputeValues | null}[];
 };
 
 export class SolanaWalletCompatibilityError extends Error {
@@ -83,6 +83,9 @@ export function createSolanaWalletCompatibilityReport(options: {
   const instructions = Array.from({length: Math.max(oldInstructions.length, newInstructions.length)}, (_, index) => {
     const before = oldInstructions[index], after = newInstructions[index];
     return {index, expectedCategory: before ? category(expected, before) : null, returnedCategory: after ? category(actual, after) : null,
+      expectedProgram: before ? expected.staticAccountKeys[before.programIdIndex]?.toBase58() ?? null : null,
+      returnedProgram: after ? actual.staticAccountKeys[after.programIdIndex]?.toBase58() ?? null : null,
+      returnedDiscriminator: after?.data[0] ?? null,
       programEqual: !!before && !!after && sameKey(expected.staticAccountKeys[before.programIdIndex], actual.staticAccountKeys[after.programIdIndex]),
       dataEqual: !!before && !!after && equal(before.data, after.data),
       accountsEqual: !!before && !!after && before.accountKeyIndexes.length === after.accountKeyIndexes.length && before.accountKeyIndexes.every((accountIndex, position) => sameAccount(expected, accountIndex, actual, after.accountKeyIndexes[position])),

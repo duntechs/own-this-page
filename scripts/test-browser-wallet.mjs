@@ -3,9 +3,9 @@ import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import vm from 'node:vm';
-import {createPrivateKey, sign} from 'node:crypto';
+import {createHash, createPrivateKey, sign} from 'node:crypto';
 import {build} from 'vite';
-import {ComputeBudgetProgram, Keypair, PublicKey, TransactionMessage, VersionedTransaction} from '@solana/web3.js';
+import {ComputeBudgetProgram, Keypair, PublicKey, TransactionInstruction, TransactionMessage, VersionedTransaction} from '@solana/web3.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const payer = Keypair.generate();
@@ -16,12 +16,43 @@ const entry = `
   export {Buffer as BrowserBuffer} from 'buffer';
   export {connectSolanaWallet, createVersionedSolanaDeploymentSigner, signSolanaImageUpload} from ${JSON.stringify(path.join(root, 'lib/solana-wallet.ts'))};
   export {DeploymentEngine} from ${JSON.stringify(path.join(root, 'lib/solana-deploy.ts'))};
+  export {validateSolanaTransactionCompatibility} from ${JSON.stringify(path.join(root, 'lib/solana-transaction-compatibility.ts'))};
   import {PublicKey, SystemProgram, TransactionMessage, VersionedTransaction} from '@solana/web3.js';
   export function unsignedTransaction(payer, destination, blockhash) {
     const fromPubkey = new PublicKey(payer), toPubkey = new PublicKey(destination);
     return new VersionedTransaction(new TransactionMessage({payerKey: fromPubkey, recentBlockhash: blockhash, instructions: [SystemProgram.transfer({fromPubkey, toPubkey, lamports: 1})]}).compileToV0Message());
   }
 `;
+
+const lighthouse = new PublicKey('L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95');
+// Synthetic valid assertions reproduce the user's observed shape: one extra
+// readonly program, three added instructions, and 121 extra message bytes.
+// These are test fixtures, not a claim to possess the user's private packet.
+function guardedTransaction(input, mode = 'guarded') {
+  const decoded = TransactionMessage.decompile(input.message);
+  const target = [{pubkey: payer.publicKey, isSigner: false, isWritable: false}];
+  const clock = new TransactionInstruction({programId: lighthouse, keys: [], data: Buffer.from([15, 0, 0, ...new Uint8Array(8), 4])});
+  const balance = new TransactionInstruction({programId: lighthouse, keys: target, data: Buffer.from([5, 0, 0, ...new Uint8Array(8), 4])});
+  const multi = new TransactionInstruction({programId: lighthouse, keys: target, data: Buffer.from([
+    6, 0, 4, 8, ...createHash('sha256').update(Buffer.alloc(0)).digest(), 0, 0,
+    1, ...new Uint8Array(8), 0, 5, 1, 0, 7, 0, 0,
+  ])});
+  if (mode === 'guarded-unknown-program') clock.programId = Keypair.generate().publicKey;
+  if (mode === 'guarded-memory') balance.data[0] = 0;
+  if (mode === 'guarded-cpi-logging') balance.data[1] = 3;
+  if (mode === 'guarded-trailing-data') balance.data = Buffer.concat([balance.data, Buffer.from([0])]);
+  if (mode === 'guarded-malformed-vector') multi.data[2] = 0;
+  if (mode === 'guarded-invalid-enum') balance.data[balance.data.length - 1] = 8;
+  if (mode === 'guarded-compute-change') decoded.instructions[1].data = ComputeBudgetProgram.setComputeUnitPrice({microLamports: 10001}).data;
+  if (mode === 'guarded-payment-change') decoded.instructions[2].data[decoded.instructions[2].data.length - 1] ^= 1;
+  if (mode === 'guarded-loader-change') decoded.instructions[3].data[0] ^= 1;
+  if (mode === 'guarded-privilege-change') balance.keys = [...target, {pubkey: decoded.instructions[3].programId, isSigner: false, isWritable: true}];
+  if (mode === 'guarded-blockhash-change') decoded.recentBlockhash = Keypair.generate().publicKey.toBase58();
+  decoded.instructions.splice(2, 0, clock);
+  decoded.instructions.push(balance, multi);
+  if (mode === 'guarded-too-many') decoded.instructions.push(...Array.from({length: 6}, () => clock));
+  return new VersionedTransaction(input.version === 'legacy' ? decoded.compileToLegacyMessage() : decoded.compileToV0Message());
+}
 
 async function browserBundle(oldComparisons = false) {
   const outDir = path.join(root, '.sites-runtime/browser-wallet-tests', oldComparisons ? 'old' : 'current');
@@ -71,6 +102,7 @@ function wallet(mode) {
       fixture.signingCalls++;
       return inputs.map(input => {
         let tx = VersionedTransaction.deserialize(input.transaction);
+        if (mode?.startsWith('guarded')) tx = guardedTransaction(tx, mode);
         if (mode === 'v1-conversion') {
           // The installed SDK reads v1 but intentionally cannot serialize it.
           // Encode the documented wire layout only to test diagnostic handling
@@ -99,7 +131,7 @@ function wallet(mode) {
           tx.signatures = [new Uint8Array(64), new Uint8Array(64)];
         }
         tx.sign([payer]);
-        if (mode === 'invalid-transaction-signature') tx.signatures[0][0] ^= 1;
+        if (mode === 'invalid-transaction-signature' || mode === 'guarded-invalid-signature') tx.signatures[0][0] ^= 1;
         return {signedTransaction: Uint8Array.from(tx.serialize())};
       });
     }},
@@ -193,6 +225,32 @@ await check('actual browser-engine seeded upload-account transaction survives ex
   const [signed] = await signer.signTransactions([first]);
   assert.deepEqual(Uint8Array.from(signed.message.serialize()), Uint8Array.from(first.message.serialize()));
   assert(first.signatures[0].every(byte => byte === 0));
+});
+await check('browser signer accepts and preserves three valid assertions with the reported 121-byte growth', async () => {
+  const fixture = wallet('guarded');
+  const signer = current.createVersionedSolanaDeploymentSigner(await current.connectSolanaWallet(fixture));
+  const [signed] = await signer.signTransactions([first]);
+  const expectedGuarded = guardedTransaction(VersionedTransaction.deserialize(first.serialize()));
+  assert.equal(signed.message.staticAccountKeys.length - first.message.staticAccountKeys.length, 1);
+  assert.equal(signed.message.compiledInstructions.length, 7);
+  assert.equal(signed.message.serialize().length - first.message.serialize().length, 121);
+  assert.deepEqual(Uint8Array.from(signed.message.serialize()), Uint8Array.from(expectedGuarded.message.serialize()), 'No assertion may be stripped or rewritten');
+  assert.equal(signed.message.recentBlockhash, first.message.recentBlockhash);
+  assert(signed.serialize().length <= 1232);
+  assert.equal(fixture.signingCalls, 1);
+  assert(first.signatures[0].every(byte => byte === 0));
+});
+await check('browser guard acceptance still rejects altered payments, authority, fees, privileges and unknown assertion operations', async () => {
+  for (const mode of ['guarded-unknown-program', 'guarded-memory', 'guarded-cpi-logging', 'guarded-trailing-data', 'guarded-malformed-vector', 'guarded-invalid-enum', 'guarded-compute-change', 'guarded-payment-change', 'guarded-loader-change', 'guarded-privilege-change', 'guarded-blockhash-change', 'guarded-too-many', 'guarded-invalid-signature']) {
+    const signer = current.createVersionedSolanaDeploymentSigner(await current.connectSolanaWallet(wallet(mode)));
+    await assert.rejects(signer.signTransactions([first]), error => {
+      if (mode === 'guarded-invalid-signature') return /valid deployment signature/.test(error.message);
+      assert.equal(error.name, 'SolanaWalletCompatibilityError', mode);
+      assert(error.report.instructions.some(item => item.returnedProgram === lighthouse.toBase58()));
+      if (mode === 'guarded-memory') assert(error.report.instructions.some(item => item.returnedProgram === lighthouse.toBase58() && item.returnedDiscriminator === 0));
+      return true;
+    });
+  }
 });
 await check('actual deployment transaction changes are rejected with a shareable report and no signed packets', async () => {
   for (const mode of ['changed-transaction', 'legacy-conversion', 'v1-conversion', 'changed-priority', 'changed-limit', 'changed-instruction', 'changed-account-order', 'extra-signer']) {

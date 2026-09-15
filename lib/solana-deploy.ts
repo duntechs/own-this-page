@@ -2,12 +2,15 @@ import {Buffer} from 'buffer';
 import {ComputeBudgetProgram, Connection, PublicKey, SystemProgram, SYSVAR_CLOCK_PUBKEY, SYSVAR_RENT_PUBKEY, TransactionInstruction, TransactionMessage, VersionedTransaction, type AccountInfo} from '@solana/web3.js';
 import {SOLANA_GENESIS, SOLANA_TREASURY, selectPriorityMicroLamports, withSolanaTimeout, type SolanaCluster} from './solana-client';
 import {encodeSolanaSignature} from './solana-wallet';
+import {validateSolanaTransactionCompatibility} from './solana-transaction-compatibility';
 
 // The release is pinned independently of anything supplied by localStorage or
 // an uploaded configuration. A replacement release requires a new review.
 export const DEPLOYMENT_PROGRAM_SHA256 = '0bfd88426f4163f805d8b39026e145c2d0baa66063223a87e27e75a148c7c3bf';
 export const DEPLOYMENT_PROGRAM_LENGTH = 105016;
-export const DEPLOYMENT_WRITE_BYTES = 900;
+// Leave room in Solana's 1,232-byte packet for supported wallet assertions.
+export const DEPLOYMENT_WRITE_BYTES = 700;
+const LEGACY_DEPLOYMENT_WRITE_BYTES = 900;
 export const DEPLOYMENT_LOADER = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
 const OWNER = new PublicKey(SOLANA_TREASURY);
 const BUFFER_HEADER = 37, PROGRAM_HEADER = 36, DATA_HEADER = 45;
@@ -21,9 +24,9 @@ export type DeploymentProgress = {stage: 'checking' | 'signing' | 'confirming' |
 export type DeploymentResult = {programId: string; signature: string; programSha256: string; programLength: number; cluster: SolanaCluster};
 export type DeploymentEstimate = {requiredLamports: number; remainingNetworkFeesLamports: number; bufferRentLamports: number; programRentLamports: number; programDataRentLamports: number; remainingTransactions: number; writtenBytes: number; totalBytes: number; pendingTransactions: number; programId: string; bufferId: string};
 export type DeploymentInspection = {stage: 'new' | 'uploading' | 'pending' | 'verified'; bufferId?: string; programId?: string; writtenBytes: number; totalBytes: number; pendingTransactions: number; result?: DeploymentResult};
-type Action = {kind: 'buffer' | 'write' | 'deploy'; offset?: number; rentLamports: number};
+type Action = {kind: 'buffer' | 'write' | 'deploy'; offset?: number; writeLength?: number; rentLamports: number};
 type Pending = Action & {signature: string; raw: string; blockhash: string; lastValidBlockHeight: number; priority: number; feeLamports: number};
-type Checkpoint = {version: 1; cluster: SolanaCluster; wallet: string; programSha256: string; bufferSeed: string; programSeed: string; bufferId: string; programId: string; minimumContextSlot: number; pending: Pending[]; finalSignature?: string; finalConfirmed?: boolean};
+type Checkpoint = {version: 1; cluster: SolanaCluster; wallet: string; programSha256: string; bufferSeed: string; programSeed: string; bufferId: string; programId: string; minimumContextSlot: number; pending: Pending[]; walletAssertions?: boolean; finalSignature?: string; finalConfirmed?: boolean};
 type ChainState = {buffer: AccountInfo<Buffer> | null; program: AccountInfo<Buffer> | null; missingOffsets: number[]; writtenBytes: number; result?: DeploymentResult};
 export class DeploymentPausedError extends Error {constructor(message = 'Deployment paused. Your saved upload will be checked before resuming.') {super(message); this.name = 'DeploymentPausedError';}}
 
@@ -48,8 +51,11 @@ function loaderInstructions(state: Checkpoint, action: Action, binary: Uint8Arra
   if (action.kind === 'buffer') return [create(buffer, state.bufferSeed, BUFFER_HEADER + binary.length), new TransactionInstruction({programId: DEPLOYMENT_LOADER, data: u32(0), keys: [{pubkey: buffer, isSigner: false, isWritable: true}, {pubkey: OWNER, isSigner: false, isWritable: false}]})];
   if (action.kind === 'write') {
     const offset = integer(action.offset!, 'upload offset');
-    if (offset % DEPLOYMENT_WRITE_BYTES !== 0 || offset >= binary.length || action.rentLamports !== 0) throw Error('Invalid upload range.');
-    const bytes = binary.subarray(offset, Math.min(offset + DEPLOYMENT_WRITE_BYTES, binary.length));
+    // Version-1 receipts created before wallet assertions used 900-byte writes
+    // and did not store a length. Reconstruct those exact signed bytes.
+    const length = action.writeLength === undefined ? Math.min(LEGACY_DEPLOYMENT_WRITE_BYTES, binary.length - offset) : integer(action.writeLength, 'upload length');
+    if (offset >= binary.length || !length || length > LEGACY_DEPLOYMENT_WRITE_BYTES || offset + length > binary.length || action.rentLamports !== 0) throw Error('Invalid upload range.');
+    const bytes = binary.subarray(offset, offset + length);
     return [new TransactionInstruction({programId: DEPLOYMENT_LOADER, data: Buffer.concat([u32(1), u32(offset), u64(bytes.length), Buffer.from(bytes)]), keys: [{pubkey: buffer, isSigner: false, isWritable: true}, {pubkey: OWNER, isSigner: true, isWritable: false}]})];
   }
   if (action.kind !== 'deploy') throw Error('Unknown deployment action.');
@@ -66,10 +72,12 @@ function transactionFor(state: Checkpoint, action: Action, binary: Uint8Array, b
 }
 
 async function checkSignature(transaction: VersionedTransaction, expectedMessage: Uint8Array) {
-  if (transaction.version !== 0 || !equal(transaction.message.serialize(), expectedMessage) || transaction.message.header.numRequiredSignatures !== 1 || transaction.signatures.length !== 1 || !transaction.message.staticAccountKeys[0].equals(OWNER)) throw Error('The wallet changed the deployment transaction. Nothing new was submitted.');
+  const compatibility = validateSolanaTransactionCompatibility(expectedMessage, transaction.message);
+  if (transaction.version !== 0 || !compatibility.compatible || transaction.message.header.numRequiredSignatures !== 1 || transaction.signatures.length !== 1 || !transaction.message.staticAccountKeys[0].equals(OWNER)) throw Error('The wallet changed the deployment transaction. Nothing new was submitted.');
   const key = await crypto.subtle.importKey('raw', Uint8Array.from(OWNER.toBytes()), {name: 'Ed25519'}, false, ['verify']);
-  if (!await crypto.subtle.verify('Ed25519', key, Uint8Array.from(transaction.signatures[0]), Uint8Array.from(expectedMessage))) throw Error('The deployment wallet signature is invalid. Nothing new was submitted.');
+  if (!await crypto.subtle.verify('Ed25519', key, Uint8Array.from(transaction.signatures[0]), Uint8Array.from(transaction.message.serialize()))) throw Error('The deployment wallet signature is invalid. Nothing new was submitted.');
   if (transaction.serialize().length > 1232) throw Error('The signed deployment packet is too large.');
+  return compatibility.guarded;
 }
 
 export class DeploymentEngine {
@@ -110,13 +118,14 @@ export class DeploymentEngine {
     const s = JSON.parse(raw) as Checkpoint;
     if (!s || s.version !== 1 || s.cluster !== this.cluster || s.wallet !== SOLANA_TREASURY || s.programSha256 !== DEPLOYMENT_PROGRAM_SHA256 || !/^[a-f0-9]{32}$/.test(s.bufferSeed) || !/^[a-f0-9]{32}$/.test(s.programSeed) || s.bufferSeed === s.programSeed || !Array.isArray(s.pending) || s.pending.length > 5) throw Error('The saved deployment does not match this owner, network, or release. Keep the saved record for recovery.');
     integer(s.minimumContextSlot, 'saved confirmation context');
+    if (s.walletAssertions !== undefined && typeof s.walletAssertions !== 'boolean') throw Error('Invalid saved wallet assertion mode.');
     if ((await PublicKey.createWithSeed(OWNER, s.bufferSeed, DEPLOYMENT_LOADER)).toBase58() !== s.bufferId || (await PublicKey.createWithSeed(OWNER, s.programSeed, DEPLOYMENT_LOADER)).toBase58() !== s.programId || s.programId === s.bufferId) throw Error('The saved deployment addresses are invalid.');
     for (const p of s.pending) {
       integer(p.rentLamports, 'saved account deposit'); integer(p.lastValidBlockHeight, 'saved expiry'); integer(p.feeLamports, 'saved network fee');
       if (typeof p.raw !== 'string' || p.raw.length > 1644 || !/^[A-Za-z0-9+/]+={0,2}$/.test(p.raw)) throw Error('The saved signed deployment packet is invalid.');
       const tx = VersionedTransaction.deserialize(Buffer.from(p.raw, 'base64'));
       const expected = transactionFor(s, p, this.binary, p.blockhash, p.priority);
-      await checkSignature(tx, expected.message.serialize());
+      if (await checkSignature(tx, expected.message.serialize())) s.walletAssertions = true;
       if (encodeSolanaSignature(tx.signatures[0]) !== p.signature) throw Error('The saved deployment receipt does not match its signed transaction.');
     }
     if (s.finalSignature !== undefined && !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(s.finalSignature)) throw Error('Invalid saved deployment signature.');
@@ -162,7 +171,10 @@ export class DeploymentEngine {
       const actual = buffer?.data.subarray(BUFFER_HEADER + offset, BUFFER_HEADER + offset + expected.length);
       if (actual && equal(actual, expected)) writtenBytes += expected.length;
       else {
-        if (actual?.some(x => x !== 0)) throw Error(`The saved upload contains unexpected bytes at offset ${offset}. It will not be silently overwritten.`);
+        // Old 900-byte writes can end inside a new 700-byte range. Rewriting
+        // matching bytes is idempotent; any differing nonzero byte still stops
+        // recovery rather than concealing a corrupt or unrelated upload.
+        if (actual?.some((x, index) => x !== 0 && x !== expected[index])) throw Error(`The saved upload contains unexpected bytes at offset ${offset}. It will not be silently overwritten.`);
         missingOffsets.push(offset);
       }
     }
@@ -191,7 +203,7 @@ export class DeploymentEngine {
     const base = {writtenBytes: view.writtenBytes, totalBytes: this.binary.length, pendingTransactions: s.pending.length, programId: s.programId, bufferId: s.bufferId};
     if (view.result) return {...base, requiredLamports: 0, remainingNetworkFeesLamports: 0, bufferRentLamports: 0, programRentLamports: 0, programDataRentLamports: 0, remainingTransactions: 0};
     const rent = await this.rents(), recent = await this.rpc(this.connection.getLatestBlockhash({commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}));
-    const actions: Action[] = [...(!view.buffer ? [{kind: 'buffer' as const, rentLamports: rent.buffer}] : []), ...(view.missingOffsets.length ? [{kind: 'write' as const, offset: view.missingOffsets[0], rentLamports: 0}] : []), {kind: 'deploy', rentLamports: rent.program}];
+    const actions: Action[] = [...(!view.buffer ? [{kind: 'buffer' as const, rentLamports: rent.buffer}] : []), ...(view.missingOffsets.length ? [{kind: 'write' as const, offset: view.missingOffsets[0], writeLength: Math.min(DEPLOYMENT_WRITE_BYTES, this.binary.length - view.missingOffsets[0]), rentLamports: 0}] : []), {kind: 'deploy', rentLamports: rent.program}];
     const fees = await Promise.all(actions.map(action => this.fee(transactionFor(s, action, this.binary, recent.blockhash, MAX_PRIORITY))));
     const networkFees = sum(...actions.map((action, i) => fees[i] * (action.kind === 'write' ? view.missingOffsets.length : 1)), ...s.pending.map(p => p.feeLamports));
     const bufferRent = view.buffer ? 0 : rent.buffer;
@@ -279,13 +291,26 @@ export class DeploymentEngine {
     const signed = await withSolanaTimeout(signer.signTransactions(txs), 120_000);
     await this.signerReady(signer);
     if (signed.length !== txs.length) throw Error('The wallet returned an incomplete deployment batch.');
-    for (let i = 0; i < signed.length; i++) await checkSignature(signed[i], snapshots[i]);
+    let guarded = false;
+    for (let i = 0; i < signed.length; i++) guarded = await checkSignature(signed[i], snapshots[i]) || guarded;
+    if (guarded) s.walletAssertions = true;
+    else if (s.walletAssertions === undefined) s.walletAssertions = false;
+    // The approved returned messages can contain read-only wallet assertions.
+    // Check their actual fee and simulate those signed bytes, not only the
+    // unsigned originals, before any recoverable packet is persisted or sent.
+    const signedFees = await Promise.all(signed.map(tx => this.fee(tx)));
+    const signedBatchCost = sum(...actions.map((action, index) => sum(action.rentLamports, signedFees[index], action.kind === 'deploy' ? dataRent : 0)));
+    if (sum(budget.reserved, signedBatchCost) > budget.maximum) throw Error('The signed deployment cost exceeds your approved limit. Nothing new was submitted. Review a new estimate.');
+    const signedSimulations = await Promise.all(signed.map(tx => this.rpc(this.connection.simulateTransaction(tx, {sigVerify: true, replaceRecentBlockhash: false, commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}))));
+    if (signedSimulations.some(result => result.value.err)) throw Error('The signed deployment transaction failed simulation. Nothing new was submitted.');
+    await this.signerReady(signer);
     if (integer(await this.rpc(this.connection.getBlockHeight(COMMITMENT)), 'current block height') > latest.lastValidBlockHeight) throw new DeploymentPausedError('Wallet approval expired before submission. No new transaction was sent; resume for fresh approvals.');
+    await this.signerReady(signer);
     this.checkPaused();
-    s.pending = signed.map((tx,i) => ({...actions[i], signature: encodeSolanaSignature(tx.signatures[0]), raw: Buffer.from(tx.serialize()).toString('base64'), blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight, priority, feeLamports: fees[i]}));
+    s.pending = signed.map((tx,i) => ({...actions[i], signature: encodeSolanaSignature(tx.signatures[0]), raw: Buffer.from(tx.serialize()).toString('base64'), blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight, priority, feeLamports: signedFees[i]}));
     if (actions[0].kind === 'deploy') s.finalSignature = s.pending[0].signature;
     this.save(); // Persist EVERY approved packet before ANY packet is sent.
-    budget.reserved = sum(budget.reserved, batchCost);
+    budget.reserved = sum(budget.reserved, signedBatchCost);
     this.update('confirming', 'Checking the signed deployment transactions on Solana.', s.pending[0].signature);
     await Promise.allSettled(s.pending.map(p => this.broadcast(p)));
     await this.confirmPending();
@@ -317,7 +342,11 @@ export class DeploymentEngine {
       while (view.missingOffsets.length) {
         this.checkPaused();
         this.update('uploading', `Program upload: ${Math.floor(view.writtenBytes / this.binary.length * 100)}%. Your verified progress is saved.`);
-        await this.send(view.missingOffsets.slice(0, 5).map(offset => ({kind: 'write', offset, rentLamports: 0})), signer, budget, rent.data);
+        // Wallet balance assertions can depend on the previous transaction's
+        // fee. Prepare the next guarded write only after that state confirms.
+        // An older checkpoint with no mode starts with one write as well, so
+        // guard behavior is known before any multi-transaction wallet request.
+        await this.send(view.missingOffsets.slice(0, this.state!.walletAssertions === false ? 5 : 1).map(offset => ({kind: 'write', offset, writeLength: Math.min(DEPLOYMENT_WRITE_BYTES, this.binary.length - offset), rentLamports: 0})), signer, budget, rent.data);
         view = await this.chainState();
       }
       this.checkPaused();

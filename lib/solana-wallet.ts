@@ -3,6 +3,7 @@ import {getWallets} from '@wallet-standard/app';
 import {PublicKey, Transaction, VersionedTransaction} from '@solana/web3.js';
 import {buildSolanaTransaction, SLOT_ACCOUNT_SIZE, withSolanaTimeout, readSolanaSlots, sameSolanaQuote, verifySolanaProgram, type PreparedSolanaAction, type SolanaCluster} from './solana-client';
 import {createSolanaWalletCompatibilityReport, SolanaWalletCompatibilityError} from './solana-wallet-diagnostics';
+import {validateSolanaTransactionCompatibility} from './solana-transaction-compatibility';
 
 type StandardWallet = ReturnType<ReturnType<typeof getWallets>['get']>[number];
 type StandardAccount = StandardWallet['accounts'][number];
@@ -82,9 +83,12 @@ export async function disconnectSolanaWallet(session: SolanaWalletSession): Prom
 
 export function verifySignedSolanaTransaction(expected: Transaction, signedBytes: Uint8Array, address: string): Transaction {
   if (signedBytes.length > 1232) throw Error('The wallet returned an oversized transaction.');
+  const decoded = VersionedTransaction.deserialize(signedBytes);
+  if (decoded.version !== 'legacy' || !validateSolanaTransactionCompatibility(expected.serializeMessage(), decoded.message).compatible) throw Error('The wallet changed the transaction. Nothing was submitted.');
   const signed = Transaction.from(signedBytes);
-  if (!Buffer.from(signed.serializeMessage()).equals(expected.serializeMessage()) || signed.feePayer?.toBase58() !== address) throw Error('The wallet changed the transaction. Nothing was submitted.');
+  if (!Buffer.from(signed.serializeMessage()).equals(Buffer.from(decoded.message.serialize())) || signed.feePayer?.toBase58() !== address) throw Error('The wallet changed the transaction. Nothing was submitted.');
   if (!signed.verifySignatures() || signed.signatures.length !== 1 || signed.signatures[0].publicKey.toBase58() !== address) throw Error('The wallet did not return the required valid signature.');
+  if (!Buffer.from(signed.serialize()).equals(Buffer.from(signedBytes))) throw Error('The signed transaction could not be preserved. Nothing was submitted.');
   return signed;
 }
 
@@ -135,8 +139,9 @@ export function createSolanaDeploymentSigner(session: SolanaWalletSession) {
   };
 }
 
-// Deployment uses frozen v0 messages and seeded accounts. The owner is the only
-// signer: no ephemeral account signatures need restoring or recompiling.
+// Deployment uses v0 messages and seeded accounts. The owner remains the only
+// signer. Known wallet assertions may surround the unchanged deployment;
+// the complete returned message is verified and is never stripped or re-signed.
 export function createVersionedSolanaDeploymentSigner(session: SolanaWalletSession) {
   async function signTransactions(transactions: VersionedTransaction[]): Promise<VersionedTransaction[]> {
     const account = currentAccount(session);
@@ -169,11 +174,12 @@ export function createVersionedSolanaDeploymentSigner(session: SolanaWalletSessi
       const transaction = VersionedTransaction.deserialize(item.signedTransaction);
       // The browser Buffer polyfill requires both operands to be Buffers.
       // Node also accepts Uint8Array, so SSR tests alone miss this boundary.
-      if (transaction.version !== 0 || !Buffer.from(transaction.message.serialize()).equals(Buffer.from(messages[index])) || transaction.signatures.length !== 1) {
+      const exactMessage = transaction.version === 0 && Buffer.from(transaction.message.serialize()).equals(Buffer.from(messages[index]));
+      if (transaction.signatures.length !== 1 || (!exactMessage && !validateSolanaTransactionCompatibility(messages[index], transaction.message).compatible)) {
         throw new SolanaWalletCompatibilityError(createSolanaWalletCompatibilityReport({walletName: session.wallet.name, batchIndex: index, batchCount: transactions.length,
           expectedMessage: messages[index], returnedTransaction: transaction, returnedPacket: item.signedTransaction}));
       }
-      if (!await crypto.subtle.verify({name: 'Ed25519'}, key, Uint8Array.from(transaction.signatures[0]), messages[index])) {
+      if (!await crypto.subtle.verify({name: 'Ed25519'}, key, Uint8Array.from(transaction.signatures[0]), Uint8Array.from(transaction.message.serialize()))) {
         throw Error('The wallet did not return a valid deployment signature. Nothing was submitted.');
       }
       return transaction;
@@ -229,8 +235,16 @@ export async function signAndSendSolanaTransaction(session: SolanaWalletSession,
   currentAccount(session);
   if (result.length !== 1 || !Buffer.from(transaction.serializeMessage()).equals(expectedMessage)) throw Error('The transaction changed while the wallet was open. Nothing was submitted.');
   const signed = verifySignedSolanaTransaction(transaction, result[0].signedTransaction, account.address);
+  // Wallet assertions stay in the signed packet. Requote and simulate that
+  // actual packet before saving its receipt or broadcasting any payment.
+  const signedPacket = VersionedTransaction.deserialize(signed.serialize());
+  const signedFee = await market.connection.getFeeForMessage(signedPacket.message, 'confirmed');
+  if (!Number.isSafeInteger(signedFee.value) || signedFee.value === null || signedFee.value < 0 || BigInt(signedFee.value) > prepared.feeLamports) throw Error('The network fee increased. Review the transaction again.');
+  const simulation = await market.connection.simulateTransaction(signedPacket, {commitment: 'confirmed', minContextSlot: fresh.contextSlot, sigVerify: true, replaceRecentBlockhash: false});
+  if (simulation.value.err) throw Error('The signed transaction could not be simulated successfully. Nothing was submitted. Refresh the quote before trying again.');
   await verifySolanaProgram(market);
   if (await market.connection.getBlockHeight('confirmed') > recent.lastValidBlockHeight) throw Error('The wallet approval took too long and this transaction expired. Nothing was submitted. Review it again.');
+  currentAccount(session);
   const signature = encodeSolanaSignature(signed.signature!);
   // Persist the public receipt BEFORE broadcasting, so reloads cannot hide an
   // ambiguous payment. A storage failure stops submission.
