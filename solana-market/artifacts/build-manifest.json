@@ -1,0 +1,349 @@
+{
+  "schemaVersion": 1,
+  "project": "Own This Page",
+  "network": "solana",
+  "programFile": "slot_market.so",
+  "programSha256": "0bfd88426f4163f805d8b39026e145c2d0baa66063223a87e27e75a148c7c3bf",
+  "programLength": 105016,
+  "sourceCommit": null,
+  "toolchain": {
+    "agave": "2.2.20",
+    "platformTools": "v1.48"
+  },
+  "treasury": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
+  "admin": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
+  "pricing": {
+    "currency": "SOL",
+    "minimumLamports": "100000000",
+    "maximumLamports": "2000000000",
+    "incrementLamports": "1000000",
+    "model": "fixed-area-linear-v1"
+  },
+  "slotCount": 62,
+  "catalogSha256": "7ced649c02f531c902e427da14c01e2304ce6d39ba3dfa88cf788279579c3b0c",
+  "cargoLockSha256": "089555dcb6e41ee08beaf726cc01bb8ca05d2b5be829fb89838e0f70a3617aca",
+  "sourceSha256": {
+    "solana-market/Cargo.toml": "3a4c0fa5ecb9a397509bd832c987b37ef7a00c3d64b5ff893c8dc099ca262888",
+    "solana-market/build.rs": "2e67438780828af0d5cff4870299b671fadcd2488c976f3e0652fa5931bc8bca",
+    "solana-market/src/lib.rs": "c8bcb8550b9a73184d1a899d83bf4a398f64b0f61b94cd7932bced04cfa73881",
+    "solana-market/Cargo.lock": "089555dcb6e41ee08beaf726cc01bb8ca05d2b5be829fb89838e0f70a3617aca",
+    "lib/slots.json": "7ced649c02f531c902e427da14c01e2304ce6d39ba3dfa88cf788279579c3b0c",
+    "lib/solana-pricing.ts": "3f32b42d2d7b9afcbbbe88cbe4ae33565aec8c0d8d4d14a0d7ee7f1b92b868e9"
+  },
+  "prices": [
+    {
+      "id": 0,
+      "key": "announcement",
+      "baseLamports": "251000000"
+    },
+    {
+      "id": 1,
+      "key": "wordmark",
+      "baseLamports": "130000000"
+    },
+    {
+      "id": 2,
+      "key": "nav.0",
+      "baseLamports": "103000000"
+    },
+    {
+      "id": 3,
+      "key": "nav.1",
+      "baseLamports": "103000000"
+    },
+    {
+      "id": 4,
+      "key": "nav.2",
+      "baseLamports": "103000000"
+    },
+    {
+      "id": 5,
+      "key": "nav.3",
+      "baseLamports": "103000000"
+    },
+    {
+      "id": 6,
+      "key": "hero.title",
+      "baseLamports": "792000000"
+    },
+    {
+      "id": 7,
+      "key": "hero.body",
+      "baseLamports": "332000000"
+    },
+    {
+      "id": 8,
+      "key": "hero.button",
+      "baseLamports": "147000000"
+    },
+    {
+      "id": 9,
+      "key": "hero.link",
+      "baseLamports": "110000000"
+    },
+    {
+      "id": 10,
+      "key": "hero.note",
+      "baseLamports": "125000000"
+    },
+    {
+      "id": 11,
+      "key": "hero.image",
+      "baseLamports": "2000000000"
+    },
+    {
+      "id": 12,
+      "key": "sponsor.0",
+      "baseLamports": "146000000"
+    },
+    {
+      "id": 13,
+      "key": "sponsor.1",
+      "baseLamports": "146000000"
+    },
+    {
+      "id": 14,
+      "key": "sponsor.2",
+      "baseLamports": "146000000"
+    },
+    {
+      "id": 15,
+      "key": "sponsor.3",
+      "baseLamports": "146000000"
+    },
+    {
+      "id": 16,
+      "key": "sponsor.4",
+      "baseLamports": "146000000"
+    },
+    {
+      "id": 17,
+      "key": "sponsor.5",
+      "baseLamports": "146000000"
+    },
+    {
+      "id": 18,
+      "key": "card.0.icon",
+      "baseLamports": "100000000"
+    },
+    {
+      "id": 19,
+      "key": "card.0.title",
+      "baseLamports": "156000000"
+    },
+    {
+      "id": 20,
+      "key": "card.0.body",
+      "baseLamports": "290000000"
+    },
+    {
+      "id": 21,
+      "key": "card.1.icon",
+      "baseLamports": "100000000"
+    },
+    {
+      "id": 22,
+      "key": "card.1.title",
+      "baseLamports": "156000000"
+    },
+    {
+      "id": 23,
+      "key": "card.1.body",
+      "baseLamports": "290000000"
+    },
+    {
+      "id": 24,
+      "key": "card.2.icon",
+      "baseLamports": "100000000"
+    },
+    {
+      "id": 25,
+      "key": "card.2.title",
+      "baseLamports": "156000000"
+    },
+    {
+      "id": 26,
+      "key": "card.2.body",
+      "baseLamports": "290000000"
+    },
+    {
+      "id": 27,
+      "key": "split.0.eyebrow",
+      "baseLamports": "125000000"
+    },
+    {
+      "id": 28,
+      "key": "split.0.title",
+      "baseLamports": "328000000"
+    },
+    {
+      "id": 29,
+      "key": "split.0.body",
+      "baseLamports": "328000000"
+    },
+    {
+      "id": 30,
+      "key": "split.0.bullet.0",
+      "baseLamports": "142000000"
+    },
+    {
+      "id": 31,
+      "key": "split.0.bullet.1",
+      "baseLamports": "142000000"
+    },
+    {
+      "id": 32,
+      "key": "split.0.bullet.2",
+      "baseLamports": "142000000"
+    },
+    {
+      "id": 33,
+      "key": "split.0.button",
+      "baseLamports": "114000000"
+    },
+    {
+      "id": 34,
+      "key": "split.0.image",
+      "baseLamports": "1261000000"
+    },
+    {
+      "id": 35,
+      "key": "split.1.eyebrow",
+      "baseLamports": "125000000"
+    },
+    {
+      "id": 36,
+      "key": "split.1.title",
+      "baseLamports": "328000000"
+    },
+    {
+      "id": 37,
+      "key": "split.1.body",
+      "baseLamports": "328000000"
+    },
+    {
+      "id": 38,
+      "key": "split.1.bullet.0",
+      "baseLamports": "142000000"
+    },
+    {
+      "id": 39,
+      "key": "split.1.bullet.1",
+      "baseLamports": "142000000"
+    },
+    {
+      "id": 40,
+      "key": "split.1.bullet.2",
+      "baseLamports": "142000000"
+    },
+    {
+      "id": 41,
+      "key": "split.1.button",
+      "baseLamports": "114000000"
+    },
+    {
+      "id": 42,
+      "key": "split.1.image",
+      "baseLamports": "1261000000"
+    },
+    {
+      "id": 43,
+      "key": "quote.0.text",
+      "baseLamports": "384000000"
+    },
+    {
+      "id": 44,
+      "key": "quote.0.name",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 45,
+      "key": "quote.0.title",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 46,
+      "key": "quote.1.text",
+      "baseLamports": "384000000"
+    },
+    {
+      "id": 47,
+      "key": "quote.1.name",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 48,
+      "key": "quote.1.title",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 49,
+      "key": "quote.2.text",
+      "baseLamports": "384000000"
+    },
+    {
+      "id": 50,
+      "key": "quote.2.name",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 51,
+      "key": "quote.2.title",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 52,
+      "key": "quote.3.text",
+      "baseLamports": "384000000"
+    },
+    {
+      "id": 53,
+      "key": "quote.3.name",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 54,
+      "key": "quote.3.title",
+      "baseLamports": "117000000"
+    },
+    {
+      "id": 55,
+      "key": "final.title",
+      "baseLamports": "610000000"
+    },
+    {
+      "id": 56,
+      "key": "final.body",
+      "baseLamports": "230000000"
+    },
+    {
+      "id": 57,
+      "key": "final.button",
+      "baseLamports": "154000000"
+    },
+    {
+      "id": 58,
+      "key": "footer.0",
+      "baseLamports": "132000000"
+    },
+    {
+      "id": 59,
+      "key": "footer.1",
+      "baseLamports": "132000000"
+    },
+    {
+      "id": 60,
+      "key": "footer.2",
+      "baseLamports": "103000000"
+    },
+    {
+      "id": 61,
+      "key": "footer.3",
+      "baseLamports": "103000000"
+    }
+  ],
+  "deployment": {
+    "programId": null,
+    "initialized": false
+  }
+}

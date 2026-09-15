@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.preview-build/
+.sites-runtime/
+.wrangler/
+deliverables/
+solana-market/target/
+*.tsbuildinfo
+.env
+.env.*
+*.log
+*-keypair.json
+
+# Hosting identity belongs to the private preview, not this repository.
+.openai/

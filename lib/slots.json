@@ -1,0 +1,622 @@
+[
+  {
+    "id": 0,
+    "key": "announcement",
+    "label": "Announcement bar",
+    "text": "You can buy this announcement. Yes, this one.",
+    "width": 900,
+    "height": 25,
+    "kind": "text",
+    "baseWei": "12000000000000000"
+  },
+  {
+    "id": 1,
+    "key": "wordmark",
+    "label": "Navigation wordmark",
+    "text": "Buy this wordmark",
+    "width": 180,
+    "height": 32,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 2,
+    "key": "nav.0",
+    "label": "Navigation link 1",
+    "text": "Buy this link",
+    "width": 100,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 3,
+    "key": "nav.1",
+    "label": "Navigation link 2",
+    "text": "And this one",
+    "width": 100,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 4,
+    "key": "nav.2",
+    "label": "Navigation link 3",
+    "text": "This one too",
+    "width": 100,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 5,
+    "key": "nav.3",
+    "label": "Navigation link 4",
+    "text": "One more",
+    "width": 100,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 6,
+    "key": "hero.title",
+    "label": "Hero headline",
+    "text": "Everything on this page is tradable.",
+    "width": 540,
+    "height": 180,
+    "kind": "text",
+    "baseWei": "40000000000000000"
+  },
+  {
+    "id": 7,
+    "key": "hero.body",
+    "label": "Hero subtitle",
+    "text": "The headline. The images. Even the button below. Pick a piece of this page and make it yours.",
+    "width": 480,
+    "height": 70,
+    "kind": "text",
+    "baseWei": "16000000000000000"
+  },
+  {
+    "id": 8,
+    "key": "hero.button",
+    "label": "Hero primary button",
+    "text": "Buy this button",
+    "width": 180,
+    "height": 45,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 9,
+    "key": "hero.link",
+    "label": "Hero secondary link",
+    "text": "Take this one \u2197",
+    "width": 120,
+    "height": 25,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 10,
+    "key": "hero.note",
+    "label": "Hero footnote",
+    "text": "OWNED BY NOBODY. YET.",
+    "width": 250,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 11,
+    "key": "hero.image",
+    "label": "Hero image",
+    "text": "THIS IMAGE IS FOR SALE TOO",
+    "width": 600,
+    "height": 440,
+    "kind": "image",
+    "baseWei": "100000000000000000"
+  },
+  {
+    "id": 12,
+    "key": "sponsor.0",
+    "label": "Logo slot 1",
+    "text": "Your logo here",
+    "width": 160,
+    "height": 50,
+    "kind": "image",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 13,
+    "key": "sponsor.1",
+    "label": "Logo slot 2",
+    "text": "Your logo here",
+    "width": 160,
+    "height": 50,
+    "kind": "image",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 14,
+    "key": "sponsor.2",
+    "label": "Logo slot 3",
+    "text": "Your logo here",
+    "width": 160,
+    "height": 50,
+    "kind": "image",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 15,
+    "key": "sponsor.3",
+    "label": "Logo slot 4",
+    "text": "Your logo here",
+    "width": 160,
+    "height": 50,
+    "kind": "image",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 16,
+    "key": "sponsor.4",
+    "label": "Logo slot 5",
+    "text": "Your logo here",
+    "width": 160,
+    "height": 50,
+    "kind": "image",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 17,
+    "key": "sponsor.5",
+    "label": "Logo slot 6",
+    "text": "Your logo here",
+    "width": 160,
+    "height": 50,
+    "kind": "image",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 18,
+    "key": "card.0.icon",
+    "label": "Card 1 icon",
+    "text": "\u25a1",
+    "width": 40,
+    "height": 40,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 19,
+    "key": "card.0.title",
+    "label": "Card 1 headline",
+    "text": "Buy this headline",
+    "width": 310,
+    "height": 30,
+    "kind": "text",
+    "baseWei": "8000000000000000"
+  },
+  {
+    "id": 20,
+    "key": "card.0.body",
+    "label": "Card 1 paragraph",
+    "text": "A little space for a big idea. This icon, headline, and paragraph are three separate slots.",
+    "width": 310,
+    "height": 90,
+    "kind": "text",
+    "baseWei": "14000000000000000"
+  },
+  {
+    "id": 21,
+    "key": "card.1.icon",
+    "label": "Card 2 icon",
+    "text": "\u2197",
+    "width": 40,
+    "height": 40,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 22,
+    "key": "card.1.title",
+    "label": "Card 2 headline",
+    "text": "Make your next move",
+    "width": 310,
+    "height": 30,
+    "kind": "text",
+    "baseWei": "8000000000000000"
+  },
+  {
+    "id": 23,
+    "key": "card.1.body",
+    "label": "Card 2 paragraph",
+    "text": "See something you like? Claim it. Already owned? Pay twice its last price and make it yours.",
+    "width": 310,
+    "height": 90,
+    "kind": "text",
+    "baseWei": "14000000000000000"
+  },
+  {
+    "id": 24,
+    "key": "card.2.icon",
+    "label": "Card 3 icon",
+    "text": "\u2318",
+    "width": 40,
+    "height": 40,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 25,
+    "key": "card.2.title",
+    "label": "Card 3 headline",
+    "text": "Put your name on it",
+    "width": 310,
+    "height": 30,
+    "kind": "text",
+    "baseWei": "8000000000000000"
+  },
+  {
+    "id": 26,
+    "key": "card.2.body",
+    "label": "Card 3 paragraph",
+    "text": "Your project. Your art. Your very specific opinion. There\u2019s a place for all of it right here.",
+    "width": 310,
+    "height": 90,
+    "kind": "text",
+    "baseWei": "14000000000000000"
+  },
+  {
+    "id": 27,
+    "key": "split.0.eyebrow",
+    "label": "Section 1 label",
+    "text": "A PAGE, OWNED IN PIECES",
+    "width": 250,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 28,
+    "key": "split.0.title",
+    "label": "Section 1 headline",
+    "text": "Your corner of the internet.",
+    "width": 510,
+    "height": 65,
+    "kind": "text",
+    "baseWei": "16000000000000000"
+  },
+  {
+    "id": 29,
+    "key": "split.0.body",
+    "label": "Section 1 paragraph",
+    "text": "An image for your next launch. A line for your big idea. A button that leads somewhere worth going.",
+    "width": 510,
+    "height": 65,
+    "kind": "text",
+    "baseWei": "16000000000000000"
+  },
+  {
+    "id": 30,
+    "key": "split.0.bullet.0",
+    "label": "Section 1 bullet 1",
+    "text": "This bullet is its own slot.",
+    "width": 320,
+    "height": 23,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 31,
+    "key": "split.0.bullet.1",
+    "label": "Section 1 bullet 2",
+    "text": "So is this one.",
+    "width": 320,
+    "height": 23,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 32,
+    "key": "split.0.bullet.2",
+    "label": "Section 1 bullet 3",
+    "text": "And this one too.",
+    "width": 320,
+    "height": 23,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 33,
+    "key": "split.0.button",
+    "label": "Section 1 button",
+    "text": "Buy this button \u2197",
+    "width": 140,
+    "height": 25,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 34,
+    "key": "split.0.image",
+    "label": "Section 1 image",
+    "text": "A BLANK CANVAS. YOUR NEXT AD.",
+    "width": 540,
+    "height": 300,
+    "kind": "image",
+    "baseWei": "63000000000000000"
+  },
+  {
+    "id": 35,
+    "key": "split.1.eyebrow",
+    "label": "Section 2 label",
+    "text": "ALSO UP FOR GRABS",
+    "width": 250,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 36,
+    "key": "split.1.title",
+    "label": "Section 2 headline",
+    "text": "Nobody owns this headline. Yet.",
+    "width": 510,
+    "height": 65,
+    "kind": "text",
+    "baseWei": "16000000000000000"
+  },
+  {
+    "id": 37,
+    "key": "split.1.body",
+    "label": "Section 2 paragraph",
+    "text": "A living canvas, rewritten by the people who claim it. The next chapter could be yours.",
+    "width": 510,
+    "height": 65,
+    "kind": "text",
+    "baseWei": "16000000000000000"
+  },
+  {
+    "id": 38,
+    "key": "split.1.bullet.0",
+    "label": "Section 2 bullet 1",
+    "text": "This bullet is its own slot.",
+    "width": 320,
+    "height": 23,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 39,
+    "key": "split.1.bullet.1",
+    "label": "Section 2 bullet 2",
+    "text": "So is this one.",
+    "width": 320,
+    "height": 23,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 40,
+    "key": "split.1.bullet.2",
+    "label": "Section 2 bullet 3",
+    "text": "And this one too.",
+    "width": 320,
+    "height": 23,
+    "kind": "text",
+    "baseWei": "7000000000000000"
+  },
+  {
+    "id": 41,
+    "key": "split.1.button",
+    "label": "Section 2 button",
+    "text": "Take this button \u2197",
+    "width": 140,
+    "height": 25,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 42,
+    "key": "split.1.image",
+    "label": "Section 2 image",
+    "text": "A BLANK CANVAS. YOUR NEXT AD.",
+    "width": 540,
+    "height": 300,
+    "kind": "image",
+    "baseWei": "63000000000000000"
+  },
+  {
+    "id": 43,
+    "key": "quote.0.text",
+    "label": "Quote 1",
+    "text": "Your words could be here. A hot take, a launch announcement, or something nobody saw coming.",
+    "width": 510,
+    "height": 80,
+    "kind": "text",
+    "baseWei": "19000000000000000"
+  },
+  {
+    "id": 44,
+    "key": "quote.0.name",
+    "label": "Quote 1 name",
+    "text": "Buy this name",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 45,
+    "key": "quote.0.title",
+    "label": "Quote 1 title",
+    "text": "AND THIS TITLE TOO",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 46,
+    "key": "quote.1.text",
+    "label": "Quote 2",
+    "text": "This space is holding out for a good story. Buy it and give people something to talk about.",
+    "width": 510,
+    "height": 80,
+    "kind": "text",
+    "baseWei": "19000000000000000"
+  },
+  {
+    "id": 47,
+    "key": "quote.1.name",
+    "label": "Quote 2 name",
+    "text": "Take this name",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 48,
+    "key": "quote.1.title",
+    "label": "Quote 2 title",
+    "text": "AND THIS TITLE TOO",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 49,
+    "key": "quote.2.text",
+    "label": "Quote 3",
+    "text": "A tiny corner of the internet with your name on it. Until someone else doubles down.",
+    "width": 510,
+    "height": 80,
+    "kind": "text",
+    "baseWei": "19000000000000000"
+  },
+  {
+    "id": 50,
+    "key": "quote.2.name",
+    "label": "Quote 3 name",
+    "text": "Buy this name",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 51,
+    "key": "quote.2.title",
+    "label": "Quote 3 title",
+    "text": "AND THIS TITLE TOO",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 52,
+    "key": "quote.3.text",
+    "label": "Quote 4",
+    "text": "No made-up testimonials here. Just four open spaces waiting for their first owners.",
+    "width": 510,
+    "height": 80,
+    "kind": "text",
+    "baseWei": "19000000000000000"
+  },
+  {
+    "id": 53,
+    "key": "quote.3.name",
+    "label": "Quote 4 name",
+    "text": "Take this name",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 54,
+    "key": "quote.3.title",
+    "label": "Quote 4 title",
+    "text": "AND THIS TITLE TOO",
+    "width": 200,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 55,
+    "key": "final.title",
+    "label": "Closing headline",
+    "text": "Ready to own a little internet?",
+    "width": 600,
+    "height": 120,
+    "kind": "text",
+    "baseWei": "30000000000000000"
+  },
+  {
+    "id": 56,
+    "key": "final.body",
+    "label": "Closing subtitle",
+    "text": "This headline, this line, and the button below are three more slots waiting for an owner.",
+    "width": 650,
+    "height": 30,
+    "kind": "text",
+    "baseWei": "11000000000000000"
+  },
+  {
+    "id": 57,
+    "key": "final.button",
+    "label": "Closing button",
+    "text": "Make this one yours \u2197",
+    "width": 200,
+    "height": 45,
+    "kind": "text",
+    "baseWei": "8000000000000000"
+  },
+  {
+    "id": 58,
+    "key": "footer.0",
+    "label": "Footer slot 1",
+    "text": "\u00a9 THIS PAGE. EVERY WORD HAS POTENTIAL.",
+    "width": 300,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 59,
+    "key": "footer.1",
+    "label": "Footer slot 2",
+    "text": "EVEN THIS TAGLINE IS FOR SALE.",
+    "width": 300,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "6000000000000000"
+  },
+  {
+    "id": 60,
+    "key": "footer.2",
+    "label": "Footer slot 3",
+    "text": "BUY THIS LINK",
+    "width": 100,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  },
+  {
+    "id": 61,
+    "key": "footer.3",
+    "label": "Footer slot 4",
+    "text": "AND THIS ONE",
+    "width": 100,
+    "height": 20,
+    "kind": "text",
+    "baseWei": "5000000000000000"
+  }
+]

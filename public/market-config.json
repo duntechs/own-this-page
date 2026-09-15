@@ -1,0 +1,21 @@
+{
+  "network": "solana",
+  "cluster": "mainnet-beta",
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "devWallet": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
+  "treasury": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
+  "admin": "8Rxj2R1c3kUGcdKYyLEXkzYvARxrrvFFtSEwhBPz1WN9",
+  "mint": "",
+  "programId": "",
+  "programSha256": "",
+  "programLength": 0,
+  "enabled": false,
+  "prices": {
+    "currency": "SOL",
+    "minimumLamports": "100000000",
+    "maximumLamports": "2000000000",
+    "incrementLamports": "1000000",
+    "model": "fixed-area-linear-v1"
+  },
+  "automaticCoinDetection": false
+}
