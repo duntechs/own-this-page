@@ -1,6 +1,7 @@
 // This relay never receives wallet keys. It forwards only reviewed JSON-RPC
 // methods, and only signed transaction bytes can reach sendTransaction.
 import {handleImages, type ImageEnv} from './images';
+import {sanitizeDeploymentPreflight} from '../lib/solana-deployment-fetch';
 
 export interface Env extends ImageEnv {
   ASSETS: {fetch(request: Request): Promise<Response>};
@@ -126,10 +127,11 @@ function sanitizedRpcResponse(value: unknown, calls: RpcCall[], isBatch: boolean
     seen.add(id);
     if (object(item.error) && typeof item.error.code === 'number' && Number.isInteger(item.error.code)) {
       // Upstream messages/data can echo a credential-bearing URL. Preserve only
-      // the error code; callers still reconcile saved signatures before retrying.
+      // reviewed protocol values, never logs or arbitrary provider text.
+      const preflight = item.error.code === -32002 && calls.some(call => call.id === item.id && call.method === 'sendTransaction') ? sanitizeDeploymentPreflight(item.error.data) : undefined;
       const message = item.error.code === -32002 ? 'Solana rejected transaction preflight. No transaction was accepted by this request.'
         : 'The Solana provider could not complete this request. Check saved transaction status before retrying.';
-      return {jsonrpc: '2.0', id: item.id, error: {code: item.error.code, message}};
+      return {jsonrpc: '2.0', id: item.id, error: {code: item.error.code, message, ...(preflight ? {data: preflight} : {})}};
     }
     if (!Object.hasOwn(item, 'result') || Object.hasOwn(item, 'error')) throw Error('Invalid RPC reply');
     return {jsonrpc: '2.0', id: item.id, result: item.result};

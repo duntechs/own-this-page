@@ -10,7 +10,9 @@ import {Keypair, SystemProgram, TransactionMessage, VersionedTransaction} from '
 // credential or live Solana request is used in these tests.
 const imageSource = await readFile(new URL('../worker/images.ts', import.meta.url), 'utf8');
 const imageModule = `data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(imageSource)).toString('base64')}`;
-const source = (await readFile(new URL('../worker/index.ts', import.meta.url), 'utf8')).replace("from './images'", `from '${imageModule}'`);
+const diagnosticSource = await readFile(new URL('../lib/solana-deployment-fetch.ts', import.meta.url), 'utf8');
+const diagnosticModule = `data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(diagnosticSource)).toString('base64')}`;
+const source = (await readFile(new URL('../worker/index.ts', import.meta.url), 'utf8')).replace("from './images'", `from '${imageModule}'`).replace("from '../lib/solana-deployment-fetch'", `from '${diagnosticModule}'`);
 const worker = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source)).toString('base64')}`);
 const {handleRequest, heliusEndpoint, validRpcCall, RPC_MAX_REQUEST_BYTES, RPC_MAX_RESPONSE_BYTES} = worker;
 const site = 'https://ownthispage.page';
@@ -169,6 +171,19 @@ try {
       assert.deepEqual(Buffer.from(forwarded[index].params[0], 'base64'), Buffer.from(packet), 'Signed packet must be forwarded byte for byte');
       assert.deepEqual(forwarded[index].params[1], {...outbound[index + 1].params[1], skipPreflight: false});
     }
+    // Exercise both sanitizing boundaries together, using the actual browser
+    // SDK, application fetch and Worker with a mocked provider response.
+    for(const err of ['BlockhashNotFound',{InstructionError:[2,{Custom:41}]}]){
+      globalThis.fetch=async(_url,init)=>{
+        const sent=JSON.parse(init.body);assert.equal(sent.params[1].skipPreflight,false);
+        assert.deepEqual(Buffer.from(sent.params[0],'base64'),Buffer.from(versioned));
+        return new Response(JSON.stringify({jsonrpc:'2.0',id:sent.id,error:{code:-32002,message:endpoint,data:{err,unitsConsumed:1234,context:{slot:5678},logs:[fakeKey]}}}),{headers:{'Content-Type':'application/json'}});
+      };
+      await assert.rejects(connection().sendRawTransaction(versioned,deploymentOptions),failure=>{
+        assert.deepEqual(JSON.parse(JSON.stringify(failure.report)),{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:200,rpcCode:-32002,preflight:{err,unitsConsumed:1234,contextSlot:5678}});
+        assert(!JSON.stringify(failure.report).includes(fakeKey));assert(!failure.message.includes(endpoint));return true;
+      });
+    }
   });
   await test('does not follow upstream redirects or leak authentication errors', async () => {
     for (const status of [301, 302, 307, 401, 403, 429, 500]) {
@@ -185,6 +200,28 @@ try {
     assert.equal(result.error.code, -32002); assert.equal(result.error.data, undefined); assert(!JSON.stringify(result).includes(fakeKey));
     globalThis.fetch = async () => reply({echo: endpoint});
     assert.equal((await handleRequest(request(), env())).status, 502);
+  });
+  await test('preserves only bounded send-preflight details while redacting provider text, logs and unknown errors', async () => {
+    const send=call('sendTransaction',[b64,{encoding:'base64',skipPreflight:false,maxRetries:3}]);
+    const cases=[
+      ['BlockhashNotFound','BlockhashNotFound'],
+      [{InstructionError:[4,{Custom:0xffff_ffff}]},{InstructionError:[4,{Custom:0xffff_ffff}]}],
+      [{InstructionError:[2,'InvalidAccountData']},{InstructionError:[2,'InvalidAccountData']}],
+      [{InstructionError:[256,{Custom:1}]},'UnrecognizedPreflightError'],
+      [{InstructionError:[2,{Custom:0x1_0000_0000}]},'UnrecognizedPreflightError'],
+      [{InstructionError:[2,{BorshIoError:fakeKey}]},'UnrecognizedPreflightError'],
+      [fakeKey,'UnrecognizedPreflightError'],
+      [{BlockhashNotFound:fakeKey},'UnrecognizedPreflightError'],
+    ];
+    for(const [err,expected] of cases){
+      globalThis.fetch=async()=>new Response(JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32002,message:endpoint,data:{err,unitsConsumed:199_999,context:{slot:123_456},logs:[fakeKey],returnData:{data:[b64,'base64']},accounts:[endpoint]}}}),{headers:{'Content-Type':'application/json'}});
+      const response=await handleRequest(request(send),env()),result=await bodyOf(response);assert.equal(response.status,200);
+      assert.deepEqual(result.error.data,{err:expected,unitsConsumed:199_999,contextSlot:123_456});
+      for(const secret of [fakeKey,endpoint,b64,'logs','returnData','accounts'])assert(!JSON.stringify(result).includes(secret));
+    }
+    globalThis.fetch=async()=>new Response(JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32002,data:{err:'AccountNotFound',unitsConsumed:-1,context:{slot:Number.MAX_SAFE_INTEGER+1}}}}),{headers:{'Content-Type':'application/json'}});
+    assert.deepEqual((await bodyOf(await handleRequest(request(send),env()))).error.data,{err:'AccountNotFound',unitsConsumed:null,contextSlot:null});
+    assert.equal((await bodyOf(await handleRequest(request(call('getSlot')),env()))).error.data,undefined,'Preflight details apply only to transaction submissions');
   });
   await test('permits the full deployed program account needed for exact binary verification', async () => {
     const encodedProgram = Buffer.alloc(105016 + 45, 42).toString('base64');

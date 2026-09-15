@@ -3,6 +3,7 @@ import {ComputeBudgetProgram, Connection, PublicKey, SystemProgram, SYSVAR_CLOCK
 import {SOLANA_GENESIS, SOLANA_TREASURY, selectPriorityMicroLamports, withSolanaTimeout, type SolanaCluster} from './solana-client';
 import {encodeSolanaSignature} from './solana-wallet';
 import {validateSolanaTransactionCompatibility} from './solana-transaction-compatibility';
+import {deploymentUploadBatchIsSafe} from './solana-deployment-batch';
 import {DeploymentRpcError} from './solana-deployment-fetch';
 export {DeploymentRpcError} from './solana-deployment-fetch';
 
@@ -50,7 +51,7 @@ export class DeploymentSimulationError extends Error {
 }
 type Action = {kind: 'buffer' | 'write' | 'deploy'; offset?: number; writeLength?: number; rentLamports: number};
 type Pending = Action & {signature: string; raw: string; blockhash: string; lastValidBlockHeight: number; priority: number; feeLamports: number};
-type Checkpoint = {version: 1; cluster: SolanaCluster; wallet: string; programSha256: string; bufferSeed: string; programSeed: string; bufferId: string; programId: string; minimumContextSlot: number; pending: Pending[]; walletAssertions?: boolean; finalSignature?: string; finalConfirmed?: boolean};
+type Checkpoint = {version: 1; cluster: SolanaCluster; wallet: string; programSha256: string; bufferSeed: string; programSeed: string; bufferId: string; programId: string; minimumContextSlot: number; pending: Pending[]; walletAssertions?: boolean; walletBatchSafe?: boolean; finalSignature?: string; finalConfirmed?: boolean};
 type ChainState = {buffer: AccountInfo<Buffer> | null; program: AccountInfo<Buffer> | null; missingOffsets: number[]; writtenBytes: number; result?: DeploymentResult};
 export class DeploymentPausedError extends Error {constructor(message = 'Deployment paused. Your saved upload will be checked before resuming.') {super(message); this.name = 'DeploymentPausedError';}}
 
@@ -174,6 +175,7 @@ export class DeploymentEngine {
     if (!s || s.version !== 1 || s.cluster !== this.cluster || s.wallet !== SOLANA_TREASURY || s.programSha256 !== DEPLOYMENT_PROGRAM_SHA256 || !/^[a-f0-9]{32}$/.test(s.bufferSeed) || !/^[a-f0-9]{32}$/.test(s.programSeed) || s.bufferSeed === s.programSeed || !Array.isArray(s.pending) || s.pending.length > 5) throw Error('The saved deployment does not match this owner, network, or release. Keep the saved record for recovery.');
     integer(s.minimumContextSlot, 'saved confirmation context');
     if (s.walletAssertions !== undefined && typeof s.walletAssertions !== 'boolean') throw Error('Invalid saved wallet assertion mode.');
+    if (s.walletBatchSafe !== undefined && typeof s.walletBatchSafe !== 'boolean') throw Error('Invalid saved wallet batch mode.');
     if ((await PublicKey.createWithSeed(OWNER, s.bufferSeed, DEPLOYMENT_LOADER)).toBase58() !== s.bufferId || (await PublicKey.createWithSeed(OWNER, s.programSeed, DEPLOYMENT_LOADER)).toBase58() !== s.programId || s.programId === s.bufferId) throw Error('The saved deployment addresses are invalid.');
     for (const p of s.pending) {
       integer(p.rentLamports, 'saved account deposit'); integer(p.lastValidBlockHeight, 'saved expiry'); integer(p.feeLamports, 'saved network fee');
@@ -327,9 +329,8 @@ export class DeploymentEngine {
     if (failed) throw Error('A deployment transaction failed on Solana. Its result is saved; review the wallet receipt before resuming.');
     return !remaining.length;
   }
-  private async confirmPending() {
+  private async confirmPending(lastBroadcast = 0) {
     const deadline = Date.now() + CONFIRM_MS;
-    let lastBroadcast = 0;
     while (Date.now() < deadline) {
       if (await withSolanaTimeout(this.settlePending(), Math.max(1, deadline - Date.now()))) return;
       const height = integer(await this.rpc(this.connection.getBlockHeight(COMMITMENT)), 'current block height');
@@ -354,7 +355,22 @@ export class DeploymentEngine {
     // of a signed batch. Retain EVERY receipt and let normal reconciliation
     // determine its outcome on resume. Network reply loss still follows the
     // existing confirmation/rebroadcast path with the exact approved packet.
-    for (const outcome of outcomes) if (outcome.status === 'rejected' && outcome.reason instanceof DeploymentRpcError) throw outcome.reason;
+    for (const outcome of outcomes) if (outcome.status === 'rejected' && outcome.reason instanceof DeploymentRpcError) {
+      // The same signature can reach the node before its receipt is visible.
+      // AlreadyProcessed needs status reconciliation, not a new transaction or
+      // an assumption of success. Every receipt stays pending until verified.
+      if (outcome.reason.report.rpcCode === -32002 && outcome.reason.report.preflight?.err === 'AlreadyProcessed') continue;
+      throw outcome.reason;
+    }
+  }
+  private acceptSimulationContexts(results: {context: {slot: number}}[]) {
+    const s = this.state!;
+    const slots = results.map(result => integer(result.context?.slot, 'confirmed simulation slot'));
+    if (slots.some(slot => slot < s.minimumContextSlot)) throw Error('The RPC returned a simulation older than the required confirmed state. No new transaction was submitted.');
+    // Both simulation phases explicitly use confirmed commitment. Carry their
+    // newest bank forward so a load-balanced RPC cannot preflight the signed
+    // packet against an older balance, upload account, or clock state.
+    s.minimumContextSlot = Math.max(s.minimumContextSlot, ...slots);
   }
   private async send(actions: Action[], signer: DeploymentSigner, budget: {maximum: number; reserved: number}, dataRent: number) {
     if (!actions.length || actions.length > 5 || actions.length > 1 && actions.some(a => a.kind !== 'write')) throw Error('Invalid deployment transaction batch.');
@@ -370,6 +386,7 @@ export class DeploymentEngine {
     if (sum(budget.reserved, batchCost) > budget.maximum) throw Error('The deployment cost exceeds your approved limit. Review a new estimate before continuing.');
     const simulations = await Promise.all(txs.map(tx => this.rpc(this.connection.simulateTransaction(tx, {sigVerify: false, replaceRecentBlockhash: false, commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}))));
     for (let i = 0; i < simulations.length; i++) if (simulations[i].value.err) throw simulationFailure('before-wallet', s, actions[i], txs[i], priority, simulations[i]);
+    this.acceptSimulationContexts(simulations);
     this.checkPaused();
     const snapshots = txs.map(tx => Uint8Array.from(tx.message.serialize()));
     this.update('signing', actions.length > 1 ? `Review ${actions.length} upload transactions in your wallet.` : actions[0].kind === 'buffer' ? 'Review creation of your program upload account.' : actions[0].kind === 'deploy' ? 'Review the final marketplace deployment.' : 'Review the next upload transaction.');
@@ -388,7 +405,25 @@ export class DeploymentEngine {
     if (sum(budget.reserved, signedBatchCost) > budget.maximum) throw Error('The signed deployment cost exceeds your approved limit. Nothing new was submitted. Review a new estimate.');
     const signedSimulations = await Promise.all(signed.map(tx => this.rpc(this.connection.simulateTransaction(tx, {sigVerify: true, replaceRecentBlockhash: false, commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}))));
     for (let i = 0; i < signedSimulations.length; i++) if (signedSimulations[i].value.err) throw simulationFailure('after-wallet', s, actions[i], signed[i], priority, signedSimulations[i]);
+    this.acceptSimulationContexts(signedSimulations);
     await this.signerReady(signer);
+    if (actions.every(action => action.kind === 'write')) {
+      const balance = await this.rpc(this.connection.getBalanceAndContext(OWNER, {commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}));
+      const balanceSlot = integer(balance.context?.slot, 'confirmed wallet balance slot');
+      if (balanceSlot < s.minimumContextSlot) throw Error('The RPC returned a wallet balance older than the signed simulation. Nothing new was submitted.');
+      s.minimumContextSlot = balanceSlot;
+      const batchSafe = deploymentUploadBatchIsSafe(signed, {owner: OWNER.toBase58(), buffer: s.bufferId,
+        balanceLamports: integer(balance.value, 'confirmed wallet balance'), totalFeeLamports: sum(...signedFees)});
+      await this.signerReady(signer);
+      if (signed.length > 1 && !batchSafe) {
+        // These packets have only been signed, never broadcast. Do not add
+        // an incompatible group to pending, where resume would retransmit it.
+        // Preserve the existing upload and make the next approval individual.
+        s.walletBatchSafe = false; this.save();
+        throw new DeploymentPausedError('This wallet added checks that need individual upload approvals. None of this group was submitted. Your uploaded bytes are saved; resume to continue one transaction at a time.');
+      }
+      if (s.walletBatchSafe !== false) s.walletBatchSafe = batchSafe;
+    }
     if (integer(await this.rpc(this.connection.getBlockHeight(COMMITMENT)), 'current block height') > latest.lastValidBlockHeight) throw new DeploymentPausedError('Wallet approval expired before submission. No new transaction was sent; resume for fresh approvals.');
     await this.signerReady(signer);
     this.checkPaused();
@@ -399,7 +434,9 @@ export class DeploymentEngine {
     budget.reserved = sum(budget.reserved, signedBatchCost);
     this.update('confirming', 'Checking the signed deployment transactions on Solana.', s.pending[0].signature);
     await this.broadcastSaved(s.pending);
-    await this.confirmPending();
+    // Give the accepted packet time to appear in status reads before retrying.
+    // A resumed saved packet still uses the immediate retry path above.
+    await this.confirmPending(Date.now());
     // A finalized expiry settles a receipt but does not complete its action.
     // In particular, never proceed to Write after buffer creation expired.
     // Keep the saved seeded addresses and require a fresh, reviewed resume.
@@ -436,12 +473,11 @@ export class DeploymentEngine {
       while (view.missingOffsets.length) {
         this.checkPaused();
         this.update('uploading', `Program upload: ${Math.floor(view.writtenBytes / this.binary.length * 100)}%. Your verified progress is saved.`);
-        // Wallet balance assertions can depend on the previous transaction's
-        // fee. Prepare the next guarded write only after that state confirms.
-        // An older checkpoint with no mode starts with one write as well, so
-        // guard behavior is known before any multi-transaction wallet request.
+        // Probe one upload before offering groups of five. Every signed group
+        // must pass the live balance/guard predicate again; this saved hint
+        // never authorizes changed instructions or bypasses a current check.
         const previousWrittenBytes = view.writtenBytes;
-        await this.send(view.missingOffsets.slice(0, this.state!.walletAssertions === false ? 5 : 1).map(offset => ({kind: 'write', offset, writeLength: Math.min(DEPLOYMENT_WRITE_BYTES, this.binary.length - offset), rentLamports: 0})), signer, budget, rent.data);
+        await this.send(view.missingOffsets.slice(0, this.state!.walletBatchSafe === true ? 5 : 1).map(offset => ({kind: 'write', offset, writeLength: Math.min(DEPLOYMENT_WRITE_BYTES, this.binary.length - offset), rentLamports: 0})), signer, budget, rent.data);
         view = await this.chainState();
         if (!view.result && (!view.buffer || view.writtenBytes <= previousWrittenBytes)) throw new DeploymentPausedError('The confirmed upload bytes are not visible from the RPC yet. Deployment paused before requesting another approval; resume will check the saved upload.');
       }

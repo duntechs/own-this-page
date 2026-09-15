@@ -51,6 +51,7 @@ function fixture() {
     async getLatestBlockhash(){return {blockhash:Keypair.generate().publicKey.toBase58(),lastValidBlockHeight:height+150};},
     async getFeeForMessage(){return {context:{slot},value:5000};},
     async getBalance(){return 100000000000;},
+    async getBalanceAndContext(_owner,options){assert.equal(options.commitment,'confirmed');assert(options.minContextSlot<=slot,'wallet balance must honor the confirmed simulation floor');return {context:{slot},value:100000000000};},
     async getRecentPrioritizationFees(){return [{prioritizationFee:10000}];},
     async getBlockHeight(){return height;},
     async getEpochInfo(){return {absoluteSlot:slot,blockHeight:height};},
@@ -97,7 +98,7 @@ function fixture() {
   };
   const fresh=()=>engine=new DeploymentEngine({connection:rpc,binary,storage,onUpdate:p=>update(p)});
   return {rpc,signer,storage,saved,accounts,receipts,broadcasts,applied,signedBatches,simulations,checkpoint,fresh,get engine(){return engine;},onUpdate:fn=>update=fn,
-    loseAfter(){dropAfter=true;},loseBefore(){dropBefore=true;},restore(){statusUnavailable=false;},expire(){height+=500;slot+=500;},setChangedWallet(v){changeWallet=v;},setChangedMessage(v){changeMessage=v;},setGuards(v){addGuards=v;}};
+    loseAfter(){dropAfter=true;},loseBefore(){dropBefore=true;},restore(){statusUnavailable=false;},expire(){height+=500;slot+=500;},advanceSlots(count){height+=count;slot+=count;},setChangedWallet(v){changeWallet=v;},setChangedMessage(v){changeMessage=v;},setGuards(v){addGuards=v;}};
 }
 let passed=0;
 async function check(name,fn){await fn();passed++;console.log('PASS '+name);}
@@ -137,6 +138,84 @@ await check('lost submission response persists receipts and recovers on reload w
   assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.equal(f.checkpoint().programId,saved.programId);assert.equal(f.checkpoint().pending.length,0);assert.equal(f.applied.filter(x=>x.kind==='buffer-account').length,1);assert(raw.length>0);
 });
 
+await check('an accepted send waits for its receipt instead of immediately resubmitting on the first null status',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),statuses=f.rpc.getSignatureStatuses;
+  let reads=0;
+  f.rpc.getSignatureStatuses=async ids=>{
+    const result=await statuses(ids);
+    if(++reads<=2)return {...result,value:ids.map(()=>null)};
+    return result;
+  };
+  f.onUpdate(progress=>{if(progress.stage==='uploading')e.pause();});
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+  assert.equal(reads,3);assert.equal(f.broadcasts.length,1);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.checkpoint().pending.length,0);
+  assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+});
+
+await check('AlreadyProcessed on an approved retry keeps reconciling and never substitutes a new signature',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),send=f.rpc.sendRawTransaction,statuses=f.rpc.getSignatureStatuses;
+  const now=Date.now,timer=globalThis.setTimeout;let elapsed=0,retried=false,confirmed=false,attempts=0;
+  Date.now=()=>now()+elapsed;
+  globalThis.setTimeout=(fn,ms,...args)=>timer(fn,ms===1500?0:ms,...args);
+  try {
+    f.rpc.sendRawTransaction=async(bytes,options)=>{
+      attempts++;
+      if(attempts===1)return send(bytes,options);
+      retried=true;
+      const saved=f.checkpoint();assert.equal(saved.pending.length,1);assert.equal(saved.pending[0].raw,Buffer.from(bytes).toString('base64'));
+      assert.equal(confirmed,false);throw new DeploymentRpcError(200,-32002,{err:'AlreadyProcessed'});
+    };
+    f.rpc.getSignatureStatuses=async ids=>{
+      const result=await statuses(ids);
+      if(!retried){elapsed=9000;return {...result,value:ids.map(()=>null)};}
+      confirmed=true;return result;
+    };
+    f.onUpdate(progress=>{if(progress.stage==='uploading'){assert.equal(confirmed,true);e.pause();}});
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+    assert.equal(attempts,2);assert.equal(retried,true);assert.equal(confirmed,true);assert.deepEqual(f.signedBatches,[1]);
+    assert.equal(f.checkpoint().pending.length,0);assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+  } finally {Date.now=now;globalThis.setTimeout=timer;}
+});
+
+await check('confirmed simulation contexts prevent later signed simulation and submission from using an older RPC bank',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),simulate=f.rpc.simulateTransaction,send=f.rpc.sendRawTransaction;
+  let unsignedSlot=0,signedSlot=0;
+  f.rpc.simulateTransaction=async(tx,options)=>{
+    assert.equal(options.commitment,'confirmed');
+    if(options.sigVerify)assert.equal(options.minContextSlot,unsignedSlot,'Signed simulation must use at least the unsigned simulation bank');
+    f.advanceSlots(10);
+    const result=await simulate(tx,options);
+    if(options.sigVerify)signedSlot=result.context.slot;else unsignedSlot=result.context.slot;
+    return result;
+  };
+  f.rpc.sendRawTransaction=async(bytes,options)=>{
+    // Model a load-balanced provider with an older bank available. The old
+    // code sent floor100 despite passing signed simulation at120 and failed
+    // preflight; the corrected floor excludes that older bank entirely.
+    if(options.minContextSlot<signedSlot)throw new DeploymentRpcError(200,-32002);
+    assert.equal(options.minContextSlot,signedSlot);
+    assert.equal(f.checkpoint().minimumContextSlot,signedSlot,'The confirmed send floor must survive reload with its signed packet');
+    return send(bytes,options);
+  };
+  f.onUpdate(progress=>{if(progress.stage==='uploading')e.pause();});
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+  assert.equal(unsignedSlot,110);assert.equal(signedSlot,120);assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+  assert.deepEqual(f.signedBatches,[1]);assert.equal(f.checkpoint().pending.length,0);
+});
+
+await check('invalid or regressing successful simulation contexts stop before any submission',async()=>{
+  for(const phase of ['unsigned','signed'])for(const slot of [-1,0.5,Number.MAX_SAFE_INTEGER+1,'100',null,undefined,99]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate(),simulate=f.rpc.simulateTransaction;
+    f.rpc.simulateTransaction=async(tx,options)=>{
+      const result=await simulate(tx,options);
+      return options.sigVerify===(phase==='signed')?{...result,context:{slot}}:result;
+    };
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),/confirmed simulation slot|simulation older/);
+    assert.equal(f.broadcasts.length,0);assert.equal(f.applied.length,0);assert.equal(f.checkpoint().pending.length,0);
+    assert.deepEqual(f.signedBatches,phase==='signed'?[1]:[]);
+  }
+});
+
 await check('a relay HTTP 400 surfaces immediately with its receipt intact and resume rebroadcasts the same approved packet',async()=>{
   const f=fixture();let e=f.fresh();const estimate=await e.estimate(),send=f.rpc.sendRawTransaction,packets=[];
   f.rpc.getSignatureStatuses=()=>assert.fail('An explicit submission error should surface before confirmation polling');
@@ -160,17 +239,17 @@ await check('one rejected upload in a partially accepted batch retains every rec
   const f=fixture();let e=f.fresh();const estimate=await e.estimate(),send=f.rpc.sendRawTransaction;let rejectedPacket=null;
   f.rpc.sendRawTransaction=async(bytes,options)=>{
     const tx=VersionedTransaction.deserialize(bytes),write=TransactionMessage.decompile(tx.message).instructions.some(ix=>ix.programId.equals(DEPLOYMENT_LOADER)&&ix.data.readUInt32LE(0)===1);
-    if(write&&!rejectedPacket){rejectedPacket=Buffer.from(bytes).toString('base64');throw new DeploymentRpcError(400,-32600);}
+    if(write&&f.signedBatches.at(-1)===5&&!rejectedPacket){rejectedPacket=Buffer.from(bytes).toString('base64');throw new DeploymentRpcError(400,-32600);}
     return send(bytes,options);
   };
   await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentRpcError);
-  const saved=f.checkpoint();assert.equal(saved.pending.length,5);assert(saved.pending.some(receipt=>receipt.raw===rejectedPacket));assert.deepEqual(f.signedBatches,[1,5]);
-  assert.equal(f.applied.filter(action=>action.kind==='write').length,4);
+  const saved=f.checkpoint();assert.equal(saved.pending.length,5);assert(saved.pending.some(receipt=>receipt.raw===rejectedPacket));assert.deepEqual(f.signedBatches,[1,1,5]);
+  assert.equal(f.applied.filter(action=>action.kind==='write').length,5);
   const acceptedSignatures=new Set(f.applied.filter(action=>action.kind==='write').map(action=>action.signature));
   assert.equal(saved.pending.filter(receipt=>acceptedSignatures.has(receipt.signature)).length,4);
   f.rpc.sendRawTransaction=send;e=f.fresh();f.onUpdate(progress=>{if(progress.stage==='uploading')e.pause();});
   await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
-  assert.equal(f.checkpoint().pending.length,0);assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.deepEqual(f.signedBatches,[1,5]);assert.equal(f.applied.filter(action=>action.kind==='write').length,5);
+  assert.equal(f.checkpoint().pending.length,0);assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.deepEqual(f.signedBatches,[1,1,5]);assert.equal(f.applied.filter(action=>action.kind==='write').length,6);
   assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
 });
 
@@ -229,7 +308,7 @@ await check('guarded signed receipts survive reload and complete all packet size
   assert.equal(result.programId,saved.programId);assert.equal(f.applied.filter(x=>x.kind==='buffer-account').length,1);
   assert.equal(f.applied.filter(x=>x.kind==='deploy').length,1);
   assert(f.applied.filter(x=>x.kind==='write').every(x=>x.length<=DEPLOYMENT_WRITE_BYTES));
-  assert(f.signedBatches.every(length=>length===1),'Guarded transactions need fresh state after each confirmed fee debit');
+  assert(f.signedBatches.includes(5),'Invariant guards with sufficient balance headroom can share one group approval');
   assert.equal(f.checkpoint().walletAssertions,true);
   assert(f.simulations.some(x=>x.signed));assert(f.simulations.every(x=>x.size<=1232));
   assert.equal((await f.fresh().inspect()).stage,'verified');
@@ -257,15 +336,56 @@ await check('legacy 900-byte pending receipts resume into 700-byte writes across
   assert.equal(f.applied.filter(x=>x.kind==='deploy').length,1);
 });
 
-await check('old checkpoints probe one write before selecting guarded single writes or ordinary batches',async()=>{
+await check('old checkpoints probe one write before selecting a checked group for guarded or ordinary uploads',async()=>{
   for(const guards of [false,true]){
     const f=fixture();let e=f.fresh();f.onUpdate(p=>{if(p.stage==='uploading')e.pause();});
     await assert.rejects(async()=>e.run(f.signer,(await e.estimate()).requiredLamports),DeploymentPausedError);
     const saved=f.checkpoint();delete saved.walletAssertions;f.storage.setItem([...f.saved.keys()][0],JSON.stringify(saved));
     f.setGuards(guards);f.signedBatches.length=0;e=f.fresh();
-    f.onUpdate(p=>{if(p.stage==='uploading'&&f.applied.filter(action=>action.kind==='write').length>=(guards?2:6))e.pause();});
+    f.onUpdate(p=>{if(p.stage==='uploading'&&f.applied.filter(action=>action.kind==='write').length>=6)e.pause();});
     await assert.rejects(async()=>e.run(f.signer,(await e.estimate()).requiredLamports),DeploymentPausedError);
-    assert.deepEqual(f.signedBatches,guards?[1,1]:[1,5]);assert.equal(f.checkpoint().walletAssertions,guards);
+    assert.deepEqual(f.signedBatches,[1,5]);assert.equal(f.checkpoint().walletAssertions,guards);assert.equal(f.checkpoint().walletBatchSafe,true);
+    assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+  }
+});
+
+await check('changed guards or insufficient group balance headroom pause before broadcasting and preserve individual resume',async()=>{
+  for(const mode of ['clock','balance-margin']){
+    const f=fixture();f.setGuards(true);let e=f.fresh();const estimate=await e.estimate(),sign=f.signer.signTransactions;
+    f.signer.signTransactions=async txs=>{
+      const signed=await sign(txs);
+      if(txs.length===1)return signed;
+      return signed.map(tx=>{
+        const decoded=TransactionMessage.decompile(tx.message),index=decoded.instructions.findIndex(ix=>ix.programId.equals(lighthouse));
+        if(mode==='clock')decoded.instructions[index]=new TransactionInstruction({programId:lighthouse,keys:[],data:Buffer.from([15,0,0,...new Uint8Array(8),4])});
+        else {
+          const data=Buffer.from(guard().data);data.writeBigUInt64LE(100000000000n-5000n,3);
+          decoded.instructions[index]=new TransactionInstruction({...guard(),data});
+        }
+        const changed=new VersionedTransaction(decoded.compileToV0Message());changed.sign([payer]);return changed;
+      });
+    };
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/None of this group was submitted/.test(error.message));
+    const saved=f.checkpoint();
+    assert.deepEqual(f.signedBatches,[1,1,5]);assert.equal(saved.walletBatchSafe,false);assert.equal(saved.pending.length,0);
+    assert.equal(f.broadcasts.length,2);assert.equal(f.applied.filter(action=>action.kind==='write').length,1);
+    f.signer.signTransactions=sign;e=f.fresh();
+    f.onUpdate(progress=>{if(progress.stage==='uploading'&&f.applied.filter(action=>action.kind==='write').length>=3)e.pause();});
+    await assert.rejects(async()=>e.run(f.signer,(await e.estimate()).requiredLamports),DeploymentPausedError);
+    assert.deepEqual(f.signedBatches,[1,1,5,1,1]);assert.equal(f.checkpoint().walletBatchSafe,false);
+    assert.equal(f.checkpoint().bufferId,saved.bufferId);assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+  }
+});
+
+await check('the group balance read must use a valid bank at or after the signed simulation',async()=>{
+  for(const slot of [99,-1,0.5,undefined]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate();
+    f.rpc.getBalanceAndContext=async(_owner,options)=>{
+      assert.equal(options.commitment,'confirmed');assert(options.minContextSlot>=101);
+      return {context:{slot},value:100000000000};
+    };
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),/wallet balance older|confirmed wallet balance slot/);
+    assert.equal(f.applied.filter(action=>action.kind==='write').length,0);assert.equal(f.checkpoint().pending.length,0);
     assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
   }
 });

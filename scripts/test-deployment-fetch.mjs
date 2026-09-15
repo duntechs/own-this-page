@@ -95,6 +95,30 @@ try {
     }
   });
 
+  await check('preflight reports distinguish missing blockhashes and instruction errors and independently redact unsafe details', async () => {
+    for(const [err,expected] of [
+      ['BlockhashNotFound','BlockhashNotFound'],
+      [{InstructionError:[3,{Custom:41}]},{InstructionError:[3,{Custom:41}]}],
+      [{InstructionError:[2,'ComputationalBudgetExceeded']},{InstructionError:[2,'ComputationalBudgetExceeded']}],
+      ['arbitrarySecret','UnrecognizedPreflightError'],
+      [{InstructionError:[2,{Custom:-1}]},'UnrecognizedPreflightError'],
+      [{InstructionError:[2,'arbitrarySecret']},'UnrecognizedPreflightError'],
+      [{InstructionError:[2,{BorshIoError:'arbitrarySecret'}]},'UnrecognizedPreflightError'],
+    ]){
+      globalThis.fetch=async()=>new Response(JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32002,message:'api-key=private-secret',data:{err,unitsConsumed:1234,contextSlot:5678,logs:['arbitrarySecret'],raw:'signed-packet-private'}}}),{status:200});
+      const connection=new Connection('https://rpc.invalid/api/rpc',{fetch:createDeploymentRpcFetch(),disableRetryOnRateLimit:true});
+      await assert.rejects(()=>connection.sendRawTransaction(Uint8Array.of(1,2,3),{skipPreflight:false}),error=>{
+        assert(error instanceof DeploymentRpcError);
+        assert.deepEqual(error.report,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:200,rpcCode:-32002,preflight:{err:expected,unitsConsumed:1234,contextSlot:5678}});
+        assert.match(error.message,err==='BlockhashNotFound'?/recent blockhash during preflight/:/rejected a deployment transaction during preflight/);
+        const exposed=JSON.stringify(error.report)+error.message;for(const secret of ['arbitrarySecret','private-secret','signed-packet-private','logs'])assert(!exposed.includes(secret));return true;
+      });
+    }
+    const bounded=new DeploymentRpcError(200,-32002,{err:'BlockhashNotFound',unitsConsumed:Infinity,context:{slot:-1}});
+    assert.deepEqual(bounded.report.preflight,{err:'BlockhashNotFound',unitsConsumed:null,contextSlot:null});
+    assert.equal(new DeploymentRpcError(200,-32600,{err:'BlockhashNotFound'}).report.preflight,undefined);
+  });
+
   await check('cloned response inspection leaves successful sends and non-send responses readable and unchanged', async () => {
     const responseBody = JSON.stringify({jsonrpc:'2.0',id:1,result:'unchanged-signature'});
     globalThis.fetch = async () => new Response(responseBody,{status:200});
