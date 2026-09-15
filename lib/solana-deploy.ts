@@ -24,6 +24,28 @@ export type DeploymentProgress = {stage: 'checking' | 'signing' | 'confirming' |
 export type DeploymentResult = {programId: string; signature: string; programSha256: string; programLength: number; cluster: SolanaCluster};
 export type DeploymentEstimate = {requiredLamports: number; remainingNetworkFeesLamports: number; bufferRentLamports: number; programRentLamports: number; programDataRentLamports: number; remainingTransactions: number; writtenBytes: number; totalBytes: number; pendingTransactions: number; programId: string; bufferId: string};
 export type DeploymentInspection = {stage: 'new' | 'uploading' | 'pending' | 'verified'; bufferId?: string; programId?: string; writtenBytes: number; totalBytes: number; pendingTransactions: number; result?: DeploymentResult};
+export type DeploymentSimulationReport = {
+  diagnosticVersion: 'otp-simulation-1';
+  phase: 'before-wallet' | 'after-wallet';
+  action: 'buffer' | 'write' | 'deploy';
+  offset: number | null;
+  writeLength: number | null;
+  bufferId: string;
+  programId: string;
+  simulationContextSlot: number | null;
+  minimumContextSlot: number;
+  unitsConsumed: number | null;
+  requestedCompute: {limit: number; priceMicroLamports: number};
+  error: {kind: string; instructionIndex?: number; instructionError?: string; customCode?: number};
+  failedProgram: string | null;
+};
+export class DeploymentSimulationError extends Error {
+  readonly report: DeploymentSimulationReport;
+  constructor(report: DeploymentSimulationReport) {
+    super(report.phase === 'before-wallet' ? 'A deployment transaction failed simulation. No wallet approval or new payment was requested.' : 'The signed deployment transaction failed simulation. Nothing new was submitted.');
+    this.name = 'DeploymentSimulationError'; this.report = report;
+  }
+}
 type Action = {kind: 'buffer' | 'write' | 'deploy'; offset?: number; writeLength?: number; rentLamports: number};
 type Pending = Action & {signature: string; raw: string; blockhash: string; lastValidBlockHeight: number; priority: number; feeLamports: number};
 type Checkpoint = {version: 1; cluster: SolanaCluster; wallet: string; programSha256: string; bufferSeed: string; programSeed: string; bufferId: string; programId: string; minimumContextSlot: number; pending: Pending[]; walletAssertions?: boolean; finalSignature?: string; finalConfirmed?: boolean};
@@ -38,6 +60,37 @@ function u64(value: number) {const b = Buffer.alloc(8); b.writeBigUInt64LE(BigIn
 function randomSeed() {return Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex');}
 const hash = async (bytes: Uint8Array) => Buffer.from(await crypto.subtle.digest('SHA-256', Uint8Array.from(bytes))).toString('hex');
 export const deploymentProgramDataAddress = (program: PublicKey) => PublicKey.findProgramAddressSync([program.toBytes()], DEPLOYMENT_LOADER)[0];
+
+// Simulation diagnostics contain public account IDs and bounded protocol
+// identifiers only. Never forward RPC log strings, raw packets, signatures,
+// stored seeds, or arbitrary error properties into the shareable report.
+const diagnosticNumber = (value: unknown, maximum = Number.MAX_SAFE_INTEGER): number | null => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= maximum ? value : null;
+// Protocol enum names from the pinned solana-transaction-error and
+// solana-instruction 2.2.1 sources. New/unknown names remain redacted until
+// explicitly reviewed; a short arbitrary string could still be a secret.
+const SIMULATION_ERROR_IDENTIFIERS = new Set(`AccountInUse AccountLoadedTwice AccountNotFound ProgramAccountNotFound InsufficientFundsForFee InvalidAccountForFee AlreadyProcessed BlockhashNotFound CallChainTooDeep MissingSignatureForFee InvalidAccountIndex SignatureFailure InvalidProgramForExecution SanitizeFailure ClusterMaintenance AccountBorrowOutstanding WouldExceedMaxBlockCostLimit UnsupportedVersion InvalidWritableAccount WouldExceedMaxAccountCostLimit WouldExceedAccountDataBlockLimit TooManyAccountLocks AddressLookupTableNotFound InvalidAddressLookupTableOwner InvalidAddressLookupTableData InvalidAddressLookupTableIndex InvalidRentPayingAccount WouldExceedMaxVoteCostLimit WouldExceedAccountDataTotalLimit MaxLoadedAccountsDataSizeExceeded InvalidLoadedAccountsDataSizeLimit ResanitizationNeeded UnbalancedTransaction ProgramCacheHitMaxLimit CommitCancelled GenericError InvalidArgument InvalidInstructionData InvalidAccountData AccountDataTooSmall InsufficientFunds IncorrectProgramId MissingRequiredSignature AccountAlreadyInitialized UninitializedAccount UnbalancedInstruction ModifiedProgramId ExternalAccountLamportSpend ExternalAccountDataModified ReadonlyLamportChange ReadonlyDataModified DuplicateAccountIndex ExecutableModified RentEpochModified NotEnoughAccountKeys AccountDataSizeChanged AccountNotExecutable AccountBorrowFailed DuplicateAccountOutOfSync Custom InvalidError ExecutableDataModified ExecutableLamportChange ExecutableAccountNotRentExempt UnsupportedProgramId CallDepth MissingAccount ReentrancyNotAllowed MaxSeedLengthExceeded InvalidSeeds InvalidRealloc ComputationalBudgetExceeded PrivilegeEscalation ProgramEnvironmentSetupFailure ProgramFailedToComplete ProgramFailedToCompile Immutable IncorrectAuthority AccountNotRentExempt InvalidAccountOwner ArithmeticOverflow UnsupportedSysvar IllegalOwner MaxAccountsDataAllocationsExceeded MaxAccountsExceeded MaxInstructionTraceLengthExceeded BuiltinProgramsMustConsumeComputeUnits`.split(' '));
+const diagnosticIdentifier = (value: unknown): value is string => typeof value === 'string' && SIMULATION_ERROR_IDENTIFIERS.has(value);
+function simulationErrorDetail(value: unknown): DeploymentSimulationReport['error'] {
+  if (diagnosticIdentifier(value)) return {kind: value};
+  if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 1 && 'InstructionError' in value) {
+    const instruction = value.InstructionError;
+    if (Array.isArray(instruction) && instruction.length === 2 && diagnosticNumber(instruction[0], 255) !== null) {
+      if (diagnosticIdentifier(instruction[1])) return {kind: 'InstructionError', instructionIndex: instruction[0], instructionError: instruction[1]};
+      if (instruction[1] && typeof instruction[1] === 'object' && !Array.isArray(instruction[1]) && Object.keys(instruction[1]).length === 1 && diagnosticNumber(instruction[1].Custom, 0xffff_ffff) !== null) return {kind: 'InstructionError', instructionIndex: instruction[0], instructionError: 'Custom', customCode: instruction[1].Custom};
+    }
+  }
+  return {kind: 'UnrecognizedSimulationError'};
+}
+
+function simulationFailure(phase: DeploymentSimulationReport['phase'], state: Checkpoint, action: Action, transaction: VersionedTransaction, priority: number,
+  result: {context: {slot: number}; value: {err: unknown; unitsConsumed?: number}}): DeploymentSimulationError {
+  const error = simulationErrorDetail(result.value.err);
+  const instruction = error.instructionIndex === undefined ? undefined : transaction.message.compiledInstructions[error.instructionIndex];
+  return new DeploymentSimulationError({diagnosticVersion: 'otp-simulation-1', phase, action: action.kind, offset: action.offset ?? null, writeLength: action.writeLength ?? null,
+    bufferId: state.bufferId, programId: state.programId, simulationContextSlot: diagnosticNumber(result.context.slot), minimumContextSlot: state.minimumContextSlot,
+    unitsConsumed: diagnosticNumber(result.value.unitsConsumed), requestedCompute: {limit: action.kind === 'deploy' ? 1_400_000 : 200_000, priceMicroLamports: priority}, error,
+    failedProgram: instruction ? transaction.message.staticAccountKeys[instruction.programIdIndex]?.toBase58() ?? null : null});
+}
 
 // ABI independently checked against solana-loader-v3-interface 3.0.0,
 // instruction.rs and solana-bpf-loader-program 2.2.4, both in the pinned Cargo
@@ -187,6 +240,28 @@ export class DeploymentEngine {
     const view = await this.chainState();
     return {stage: view.result ? 'verified' : this.state.pending.length ? 'pending' : 'uploading', bufferId: this.state.bufferId, programId: this.state.programId, writtenBytes: view.writtenBytes, totalBytes: this.binary.length, pendingTransactions: this.state.pending.length, result: view.result};
   }
+  async checkNextSimulation(): Promise<void> {
+    if (this.running) throw Error('Pause the active deployment before checking the next step.');
+    await this.ready(); await this.load();
+    if (!this.state) throw Error('No saved deployment is available to check. Review the deployment cost first.');
+    const s = this.state;
+    // This check is read-only: unresolved receipts are never broadcast,
+    // confirmed, removed or replaced, and no checkpoint is created or saved.
+    if (s.pending.length) throw Error('A saved transaction is unresolved. Check its result before simulating another deployment step.');
+    const view = await this.chainState();
+    if (view.result) return;
+    let action: Action;
+    if (!view.buffer) action = {kind: 'buffer', rentLamports: (await this.rents()).buffer};
+    else if (view.missingOffsets.length) action = {kind: 'write', offset: view.missingOffsets[0], writeLength: Math.min(DEPLOYMENT_WRITE_BYTES, this.binary.length - view.missingOffsets[0]), rentLamports: 0};
+    else action = {kind: 'deploy', rentLamports: (await this.rents()).program};
+    const priority = selectPriorityMicroLamports(await this.rpc(this.connection.getRecentPrioritizationFees({lockedWritableAccounts: [OWNER, new PublicKey(s.bufferId)]})));
+    const latest = await this.rpc(this.connection.getLatestBlockhash({commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}));
+    const transaction = transactionFor(s, action, this.binary, latest.blockhash, priority);
+    if (transaction.serialize().length > 1232) throw Error('The deployment packet is too large.');
+    await this.fee(transaction);
+    const result = await this.rpc(this.connection.simulateTransaction(transaction, {sigVerify: false, replaceRecentBlockhash: false, commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}));
+    if (result.value.err) throw simulationFailure('before-wallet', s, action, transaction, priority, result);
+  }
   private async fee(tx: VersionedTransaction): Promise<number> {
     const response = await this.rpc(this.connection.getFeeForMessage(tx.message, COMMITMENT));
     if (response.value === null || response.value <= 0) throw Error('The current network fee is unavailable.');
@@ -284,7 +359,7 @@ export class DeploymentEngine {
     const batchCost = sum(...actions.map((a,i) => sum(a.rentLamports, fees[i], a.kind === 'deploy' ? dataRent : 0)));
     if (sum(budget.reserved, batchCost) > budget.maximum) throw Error('The deployment cost exceeds your approved limit. Review a new estimate before continuing.');
     const simulations = await Promise.all(txs.map(tx => this.rpc(this.connection.simulateTransaction(tx, {sigVerify: false, replaceRecentBlockhash: false, commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}))));
-    if (simulations.some(result => result.value.err)) throw Error('A deployment transaction failed simulation. No wallet approval or new payment was requested.');
+    for (let i = 0; i < simulations.length; i++) if (simulations[i].value.err) throw simulationFailure('before-wallet', s, actions[i], txs[i], priority, simulations[i]);
     this.checkPaused();
     const snapshots = txs.map(tx => Uint8Array.from(tx.message.serialize()));
     this.update('signing', actions.length > 1 ? `Review ${actions.length} upload transactions in your wallet.` : actions[0].kind === 'buffer' ? 'Review creation of your program upload account.' : actions[0].kind === 'deploy' ? 'Review the final marketplace deployment.' : 'Review the next upload transaction.');
@@ -302,7 +377,7 @@ export class DeploymentEngine {
     const signedBatchCost = sum(...actions.map((action, index) => sum(action.rentLamports, signedFees[index], action.kind === 'deploy' ? dataRent : 0)));
     if (sum(budget.reserved, signedBatchCost) > budget.maximum) throw Error('The signed deployment cost exceeds your approved limit. Nothing new was submitted. Review a new estimate.');
     const signedSimulations = await Promise.all(signed.map(tx => this.rpc(this.connection.simulateTransaction(tx, {sigVerify: true, replaceRecentBlockhash: false, commitment: COMMITMENT, minContextSlot: s.minimumContextSlot}))));
-    if (signedSimulations.some(result => result.value.err)) throw Error('The signed deployment transaction failed simulation. Nothing new was submitted.');
+    for (let i = 0; i < signedSimulations.length; i++) if (signedSimulations[i].value.err) throw simulationFailure('after-wallet', s, actions[i], signed[i], priority, signedSimulations[i]);
     await this.signerReady(signer);
     if (integer(await this.rpc(this.connection.getBlockHeight(COMMITMENT)), 'current block height') > latest.lastValidBlockHeight) throw new DeploymentPausedError('Wallet approval expired before submission. No new transaction was sent; resume for fresh approvals.');
     await this.signerReady(signer);
@@ -310,10 +385,18 @@ export class DeploymentEngine {
     s.pending = signed.map((tx,i) => ({...actions[i], signature: encodeSolanaSignature(tx.signatures[0]), raw: Buffer.from(tx.serialize()).toString('base64'), blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight, priority, feeLamports: signedFees[i]}));
     if (actions[0].kind === 'deploy') s.finalSignature = s.pending[0].signature;
     this.save(); // Persist EVERY approved packet before ANY packet is sent.
+    const batchSignatures = s.pending.map(receipt => receipt.signature);
     budget.reserved = sum(budget.reserved, signedBatchCost);
     this.update('confirming', 'Checking the signed deployment transactions on Solana.', s.pending[0].signature);
     await Promise.allSettled(s.pending.map(p => this.broadcast(p)));
     await this.confirmPending();
+    // A finalized expiry settles a receipt but does not complete its action.
+    // In particular, never proceed to Write after buffer creation expired.
+    // Keep the saved seeded addresses and require a fresh, reviewed resume.
+    if (batchSignatures.some(signature => this.settledOutcomes.get(signature) === 'expired')) {
+      const step = actions[0].kind === 'buffer' ? 'upload-account' : actions[0].kind === 'deploy' ? 'final deployment' : 'upload';
+      throw new DeploymentPausedError(`The ${step} transaction expired without confirmation. No further transaction was sent. Resume will check the same saved accounts before requesting another approval.`);
+    }
   }
   async run(signer: DeploymentSigner, approvedMaxLamports: number): Promise<DeploymentResult> {
     if (this.running) throw Error('This deployment is already running.');
@@ -339,6 +422,7 @@ export class DeploymentEngine {
       if (integer(await this.rpc(this.connection.getBalance(OWNER, {commitment: COMMITMENT, minContextSlot: this.state!.minimumContextSlot})), 'wallet balance') < estimate.requiredLamports) throw Error('Your admin wallet needs more SOL for the displayed deployment reserve.');
       if (!view.buffer) await this.send([{kind: 'buffer', rentLamports: rent.buffer}], signer, budget, rent.data);
       view = await this.chainState();
+      if (!view.buffer && !view.result) throw new DeploymentPausedError('The upload account is not visible from the RPC yet. No upload transaction was sent. Resume will check the same saved account.');
       while (view.missingOffsets.length) {
         this.checkPaused();
         this.update('uploading', `Program upload: ${Math.floor(view.writtenBytes / this.binary.length * 100)}%. Your verified progress is saved.`);
@@ -346,8 +430,10 @@ export class DeploymentEngine {
         // fee. Prepare the next guarded write only after that state confirms.
         // An older checkpoint with no mode starts with one write as well, so
         // guard behavior is known before any multi-transaction wallet request.
+        const previousWrittenBytes = view.writtenBytes;
         await this.send(view.missingOffsets.slice(0, this.state!.walletAssertions === false ? 5 : 1).map(offset => ({kind: 'write', offset, writeLength: Math.min(DEPLOYMENT_WRITE_BYTES, this.binary.length - offset), rentLamports: 0})), signer, budget, rent.data);
         view = await this.chainState();
+        if (!view.result && (!view.buffer || view.writtenBytes <= previousWrittenBytes)) throw new DeploymentPausedError('The confirmed upload bytes are not visible from the RPC yet. Deployment paused before requesting another approval; resume will check the saved upload.');
       }
       this.checkPaused();
       if (!view.buffer || await hash(view.buffer.data.subarray(BUFFER_HEADER)) !== DEPLOYMENT_PROGRAM_SHA256) throw Error('The completed upload does not match the approved program. It will not be deployed.');

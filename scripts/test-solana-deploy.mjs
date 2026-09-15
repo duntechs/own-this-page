@@ -16,7 +16,7 @@ assert((await readFile(path.join(root, 'lib/solana-client.ts'), 'utf8')).include
 await build({configFile: false, root, publicDir: false, logLevel: 'silent', plugins: [{name: 'test-only-deployment-owner', transform(code, id) {
   if (id.endsWith('/lib/solana-client.ts')) return code.replaceAll(fixedOwner, payer.publicKey.toBase58());
 }}], build: {ssr: true, outDir: output, emptyOutDir: true, rollupOptions: {input: path.join(root, 'lib/solana-deploy.ts'), output: {entryFileNames: 'engine.mjs'}}}});
-const {DeploymentEngine, DeploymentPausedError, DEPLOYMENT_PROGRAM_SHA256, DEPLOYMENT_PROGRAM_LENGTH, DEPLOYMENT_WRITE_BYTES, DEPLOYMENT_LOADER, deploymentProgramDataAddress} = await import(pathToFileURL(path.join(output, 'engine.mjs')).href);
+const {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, DEPLOYMENT_PROGRAM_SHA256, DEPLOYMENT_PROGRAM_LENGTH, DEPLOYMENT_WRITE_BYTES, DEPLOYMENT_LOADER, deploymentProgramDataAddress} = await import(pathToFileURL(path.join(output, 'engine.mjs')).href);
 const binary = Uint8Array.from(await readFile(path.join(root, 'solana-market/artifacts/slot_market.so')));
 assert.equal(binary.length, DEPLOYMENT_PROGRAM_LENGTH);
 const genesis = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
@@ -256,6 +256,120 @@ await check('the saved signed receipt reserves its actual returned-message fee',
   f.rpc.getFeeForMessage=async message=>({context:{slot:100},value:message.staticAccountKeys.some(key=>key.equals(lighthouse))?7000:5000});
   f.loseBefore();await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),/unavailable/);
   assert.equal(f.checkpoint().pending[0].feeLamports,7000);assert.equal(f.applied.length,0);
+});
+
+await check('an unlanded buffer transaction expiring during confirmation never advances to write or a second approval',async()=>{
+  const f=fixture();f.setGuards(true);let e=f.fresh();const estimate=await e.estimate(),original=f.checkpoint();
+  const statuses=f.rpc.getSignatureStatuses,simulate=f.rpc.simulateTransaction;
+  let writesSimulated=0;
+  f.rpc.simulateTransaction=async(tx,options)=>{
+    const result=await simulate(tx,options);
+    if(TransactionMessage.decompile(tx.message).instructions.some(ix=>ix.programId.equals(DEPLOYMENT_LOADER)&&ix.data.readUInt32LE(0)===1)){
+      writesSimulated++;result.value.err='AccountNotFound';
+    }
+    return result;
+  };
+  f.loseBefore();
+  f.rpc.getSignatureStatuses=async ids=>{f.restore();f.expire();return statuses(ids);};
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/upload-account transaction expired/.test(error.message));
+  assert.equal(writesSimulated,0);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.applied.length,0);
+  assert.equal(f.checkpoint().pending.length,0);assert.equal(f.checkpoint().bufferId,original.bufferId);assert.equal(f.checkpoint().bufferSeed,original.bufferSeed);assert.equal(f.checkpoint().programId,original.programId);
+  f.rpc.getSignatureStatuses=statuses;f.rpc.simulateTransaction=simulate;e=f.fresh();
+  f.onUpdate(progress=>{if(progress.stage==='uploading')e.pause();});
+  const remaining=await e.estimate();assert.equal(remaining.requiredLamports,estimate.requiredLamports,'An unlanded buffer must not consume a deposit in the remaining quote');
+  await assert.rejects(()=>e.run(f.signer,remaining.requiredLamports),DeploymentPausedError);
+  assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);assert.equal(f.checkpoint().bufferId,original.bufferId);
+  assert.equal(f.applied.filter(action=>action.kind==='write').length,0);
+});
+
+await check('an expiring write pauses without re-signing and resume retains the confirmed buffer deposit',async()=>{
+  const f=fixture();f.setGuards(true);let e=f.fresh();const estimate=await e.estimate(),send=f.rpc.sendRawTransaction;
+  let expiredWrite=false;
+  f.rpc.sendRawTransaction=async(bytes,options)=>{
+    const transaction=VersionedTransaction.deserialize(bytes),instructions=TransactionMessage.decompile(transaction.message).instructions;
+    if(!expiredWrite&&instructions.some(ix=>ix.programId.equals(DEPLOYMENT_LOADER)&&ix.data.readUInt32LE(0)===1)){
+      expiredWrite=true;f.expire();const signature=signatureText(transaction.signatures[0]);f.broadcasts.push(signature);return signature;
+    }
+    return send(bytes,options);
+  };
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/upload transaction expired/.test(error.message));
+  assert.equal(expiredWrite,true);assert.deepEqual(f.signedBatches,[1,1]);assert.equal(f.applied.filter(action=>action.kind==='write').length,0);
+  const saved=f.checkpoint();assert.equal(saved.pending.length,0);assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+  e=f.fresh();const remaining=await e.estimate();assert.equal(remaining.bufferRentLamports,0);assert(remaining.requiredLamports<estimate.requiredLamports);
+  const result=await e.run(f.signer,remaining.requiredLamports);assert.equal(result.programId,saved.programId);assert.equal(f.applied.filter(action=>action.kind==='buffer-account').length,1);
+});
+
+await check('the next-step simulation never creates storage, signs, sends or reconciles pending receipts',async()=>{
+  const f=fixture();f.storage.setItem=()=>assert.fail('Read-only checking must not write recovery storage');
+  await assert.rejects(()=>f.fresh().checkNextSimulation(),/No saved deployment/);assert.equal(f.saved.size,0);assert.equal(f.simulations.length,0);
+  const pending=fixture(),engine=pending.fresh();const estimate=await engine.estimate();pending.loseBefore();
+  await assert.rejects(()=>engine.run(pending.signer,estimate.requiredLamports),/unavailable/);
+  const before=[...pending.saved];pending.storage.setItem=()=>assert.fail('Pending check cannot save');
+  pending.rpc.getSignatureStatuses=()=>assert.fail('Pending check cannot reconcile');pending.rpc.sendRawTransaction=()=>assert.fail('Pending check cannot broadcast');pending.rpc.simulateTransaction=()=>assert.fail('Pending check cannot simulate a replacement');
+  const prompts=pending.signedBatches.length;
+  await assert.rejects(()=>pending.fresh().checkNextSimulation(),/saved transaction is unresolved/);
+  assert.deepEqual([...pending.saved],before);assert.equal(pending.signedBatches.length,prompts);
+});
+
+await check('read-only next-step checks select the existing buffer, write or final deployment without modifying the saved record',async()=>{
+  const f=fixture();await f.fresh().estimate();const checkpoint=f.checkpoint(),before=[...f.saved],actions=[];
+  f.storage.setItem=()=>assert.fail('Read-only simulation cannot save');f.rpc.sendRawTransaction=()=>assert.fail('Read-only simulation cannot send');f.rpc.getSignatureStatuses=()=>assert.fail('Read-only simulation cannot reconcile');f.signer.signTransactions=()=>assert.fail('Read-only simulation cannot sign');
+  const simulate=f.rpc.simulateTransaction;
+  f.rpc.simulateTransaction=async(transaction,options)=>{
+    assert.equal(options.sigVerify,false);assert(transaction.signatures[0].every(byte=>byte===0));
+    actions.push(TransactionMessage.decompile(transaction.message).instructions.filter(ix=>ix.programId.equals(DEPLOYMENT_LOADER)).map(ix=>ix.data.readUInt32LE(0)));
+    return simulate(transaction,options);
+  };
+  await f.fresh().checkNextSimulation();
+  const successfulSimulation=f.rpc.simulateTransaction;
+  f.rpc.simulateTransaction=async()=>({context:{slot:100},value:{err:'BlockhashNotFound',unitsConsumed:0}});
+  await assert.rejects(()=>f.fresh().checkNextSimulation(),error=>error instanceof DeploymentSimulationError&&error.report.action==='buffer'&&error.report.phase==='before-wallet'&&error.report.error.kind==='BlockhashNotFound');
+  f.rpc.simulateTransaction=successfulSimulation;
+  const buffer=Buffer.alloc(binary.length+37);buffer.writeUInt32LE(1,0);buffer[4]=1;payer.publicKey.toBuffer().copy(buffer,5);f.accounts.set(checkpoint.bufferId,info(buffer));
+  await f.fresh().checkNextSimulation();
+  Buffer.from(binary).copy(f.accounts.get(checkpoint.bufferId).data,37);
+  await f.fresh().checkNextSimulation();
+  assert.deepEqual(actions,[[0],[1],[2]]);assert.deepEqual([...f.saved],before);assert.equal(f.signedBatches.length,0);assert.equal(f.broadcasts.length,0);
+});
+
+await check('simulation failures expose bounded protocol diagnostics before and after wallet approval without log or secret disclosure',async()=>{
+  for(const phase of ['before-wallet','after-wallet']){
+    const f=fixture();f.setGuards(true);const engine=f.fresh(),estimate=await engine.estimate(),simulate=f.rpc.simulateTransaction,checkpoint=f.checkpoint();
+    f.rpc.simulateTransaction=async(transaction,options)=>{
+      const result=await simulate(transaction,options);
+      if(options.sigVerify===(phase==='after-wallet'))return {context:{slot:123},value:{err:{InstructionError:[2,{Custom:41}]},unitsConsumed:199999,logs:['api-key=not-shareable',checkpoint.bufferSeed],returnData:{data:['private-packet','base64']}}};
+      return result;
+    };
+    await assert.rejects(()=>engine.run(f.signer,estimate.requiredLamports),error=>{
+      assert(error instanceof DeploymentSimulationError);const report=error.report;
+      assert.equal(report.diagnosticVersion,'otp-simulation-1');assert.equal(report.phase,phase);assert.equal(report.action,'buffer');assert.equal(report.bufferId,checkpoint.bufferId);assert.equal(report.programId,checkpoint.programId);
+      assert.equal(report.offset,null);assert.equal(report.writeLength,null);assert.equal(report.minimumContextSlot,100);assert.equal(report.simulationContextSlot,123);assert.equal(report.unitsConsumed,199999);
+      assert.deepEqual(report.requestedCompute,{limit:200000,priceMicroLamports:12000});assert.deepEqual(report.error,{kind:'InstructionError',instructionIndex:2,instructionError:'Custom',customCode:41});
+      assert.equal(report.failedProgram,phase==='after-wallet'?lighthouse.toBase58():SystemProgram.programId.toBase58());
+      const text=JSON.stringify(report);assert(text.length<1500);for(const forbidden of ['api-key',checkpoint.bufferSeed,checkpoint.programSeed,'private-packet','logs','returnData'])assert(!text.includes(forbidden));
+      return true;
+    });
+    assert.equal(f.signedBatches.length,phase==='before-wallet'?0:1);assert.equal(f.broadcasts.length,0);assert.equal(f.checkpoint().pending.length,0);
+  }
+});
+
+await check('the read-only write diagnostic preserves offset and redacts unrecognized errors and invalid numeric fields',async()=>{
+  const f=fixture();await f.fresh().estimate();const saved=f.checkpoint();
+  const buffer=Buffer.alloc(binary.length+37);buffer.writeUInt32LE(1,0);buffer[4]=1;payer.publicKey.toBuffer().copy(buffer,5);f.accounts.set(saved.bufferId,info(buffer));
+  const before=[...f.saved];f.storage.setItem=()=>assert.fail('Diagnostic check cannot save');
+  for(const rawError of ['AccountNotFound','privateApiKeyWithOnlyLetters',{InstructionError:[2,'InvalidInstructionData']},{InstructionError:[2,{Custom:7}]},{InstructionError:[2,{BorshIoError:'api-key=secret'}]}]){
+    f.rpc.simulateTransaction=async()=>({context:{slot:-1},value:{err:rawError,unitsConsumed:Infinity,logs:['secret']}});
+    await assert.rejects(()=>f.fresh().checkNextSimulation(),error=>{
+      assert(error instanceof DeploymentSimulationError);const report=error.report;
+      assert.equal(report.action,'write');assert.equal(report.offset,0);assert.equal(report.writeLength,700);assert.equal(report.simulationContextSlot,null);assert.equal(report.unitsConsumed,null);
+      assert(!JSON.stringify(report).includes('secret'));assert(!JSON.stringify(report).includes('privateApiKey'));
+      if(rawError==='AccountNotFound')assert.equal(report.error.kind,'AccountNotFound');
+      else if(rawError==='privateApiKeyWithOnlyLetters'||rawError.InstructionError?.[1]?.BorshIoError)assert.equal(report.error.kind,'UnrecognizedSimulationError');
+      else assert.equal(report.failedProgram,DEPLOYMENT_LOADER.toBase58());
+      return true;
+    });
+  }
+  assert.deepEqual([...f.saved],before);assert.equal(f.signedBatches.length,0);assert.equal(f.broadcasts.length,0);
 });
 
 console.log(`${passed} deployment engine checks passed. RPC state was simulated and test-wallet signatures verified; no network request or transaction was made.`);

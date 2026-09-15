@@ -3,12 +3,12 @@ import {Connection} from '@solana/web3.js';
 import {ArrowLeft, ArrowUpRight, Check, CheckCircle2, ChevronRight, Copy, LoaderCircle, Pause, RefreshCw, ShieldCheck, Wallet} from 'lucide-react';
 import {boundedSolanaFetch, SOLANA_TREASURY} from '../lib/solana-client';
 import {createDeploymentRpcFetch} from '../lib/solana-deployment-fetch';
-import {DeploymentEngine, DeploymentPausedError, type DeploymentEstimate, type DeploymentInspection, type DeploymentProgress, type DeploymentResult} from '../lib/solana-deploy';
+import {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, type DeploymentEstimate, type DeploymentInspection, type DeploymentProgress, type DeploymentResult} from '../lib/solana-deploy';
 import {connectSolanaWallet, createVersionedSolanaDeploymentSigner, disconnectSolanaWallet, listSolanaWallets, onSolanaAccountChange, onSolanaWalletsChanged, type SolanaWallet, type SolanaWalletSession} from '../lib/solana-wallet';
 import {SolanaWalletCompatibilityError} from '../lib/solana-wallet-diagnostics';
 import '../marketplace-setup.css';
 
-type Operation = 'checking' | 'connecting' | 'estimating' | 'deploying' | 'verifying' | null;
+type Operation = 'checking' | 'connecting' | 'estimating' | 'deploying' | 'verifying' | 'simulating' | null;
 type Health = 'checking' | 'ready' | 'unavailable';
 const ESTIMATE_LIFETIME = 120_000;
 const sol = (lamports: number) => `${(lamports / 1_000_000_000).toLocaleString('en-US', {maximumFractionDigits: 9})} SOL`;
@@ -32,7 +32,7 @@ export default function MarketplaceSetup() {
   const [result, setResult] = useState<DeploymentResult | null>(null);
   const [existingProgram, setExistingProgram] = useState('');
   const [error, setError] = useState('');
-  const [errorReport, setErrorReport] = useState<SolanaWalletCompatibilityError['report'] | null>(null);
+  const [errorReport, setErrorReport] = useState<SolanaWalletCompatibilityError['report'] | DeploymentSimulationError['report'] | null>(null);
   const [errorReportOpen, setErrorReportOpen] = useState(false);
   const [errorReportCopyFailed, setErrorReportCopyFailed] = useState(false);
   const [notice, setNotice] = useState('');
@@ -121,7 +121,7 @@ export default function MarketplaceSetup() {
         if (caught instanceof DeploymentPausedError) setNotice(caught.message);
         else {
           setError(errorText(caught));
-          if (caught instanceof SolanaWalletCompatibilityError) setErrorReport(caught.report);
+          if (caught instanceof SolanaWalletCompatibilityError || caught instanceof DeploymentSimulationError) setErrorReport(caught.report);
         }
       }
     } finally {
@@ -139,6 +139,14 @@ export default function MarketplaceSetup() {
       setInspection(next);
       if (next.result) {setResult(next.result); if (next.result.signature) setLatestSignature(next.result.signature);}
       else setProgress(null);
+    });
+  }
+
+  async function checkNextStep() {
+    setAccepted(false); setEstimate(null);
+    await exclusive('simulating', async engine => {
+      await engine.checkNextSimulation();
+      if (mounted.current) setNotice('The next deployment step passed its simulation. Nothing was signed or submitted. Check the remaining cost when you are ready to resume.');
     });
   }
 
@@ -276,10 +284,10 @@ export default function MarketplaceSetup() {
             <button type="button" className="mp-button mp-button-primary" onClick={() => void deploy()} disabled={busy || !ownerConnected || !accepted || !estimateFresh || estimate.requiredLamports <= 0}><Wallet size={16}/>{hasSavedDeployment ? 'Resume deployment in wallet' : 'Deploy marketplace in wallet'}</button>{!estimateFresh && !busy && <p className="mp-expired">Refresh the estimate above before approving.</p>}
           </div>}
 
-          {(progress || hasSavedDeployment) && <div className="mp-progress" role="status" aria-live="polite"><div className="mp-progress-heading"><strong>{operation === 'deploying' ? 'Deployment in progress' : inspection?.stage === 'pending' ? 'Checking your saved deployment' : 'Saved deployment'}</strong><span>{percent}%</span></div><progress value={percent} max={100} aria-label="Marketplace deployment progress"/><p>{progress?.message ?? (inspection?.pendingTransactions ? 'Saved transactions will be checked before any new signatures are requested.' : 'Your saved upload will be checked before resuming.')}</p><div className="mp-progress-actions">{operation === 'deploying' && <button type="button" className="mp-button mp-button-secondary" disabled={pauseRequested} onClick={() => {pauseRequestedRef.current = true; engineRef.current?.pause(); setPauseRequested(true);}}><Pause size={13}/>{pauseRequested ? 'Pausing after current batch…' : 'Pause after current batch'}</button>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Latest transaction<ArrowUpRight size={13}/></a>}{!busy && <button type="button" className="mp-text-button" onClick={() => void inspect()}>Check saved progress</button>}</div><p className="mp-keep-open">Keep this tab open during upload. If interrupted, return to this same browser and domain, then check the remaining cost to resume. Do not clear this site’s saved data.</p></div>}
+          {(progress || hasSavedDeployment) && <div className="mp-progress" role="status" aria-live="polite"><div className="mp-progress-heading"><strong>{operation === 'deploying' ? 'Deployment in progress' : inspection?.stage === 'pending' ? 'Checking your saved deployment' : 'Saved deployment'}</strong><span>{percent}%</span></div><progress value={percent} max={100} aria-label="Marketplace deployment progress"/><p>{progress?.message ?? (inspection?.pendingTransactions ? 'Saved transactions will be checked before any new signatures are requested.' : 'Your saved upload will be checked before resuming.')}</p><div className="mp-progress-actions">{operation === 'deploying' && <button type="button" className="mp-button mp-button-secondary" disabled={pauseRequested} onClick={() => {pauseRequestedRef.current = true; engineRef.current?.pause(); setPauseRequested(true);}}><Pause size={13}/>{pauseRequested ? 'Pausing after current batch…' : 'Pause after current batch'}</button>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Latest transaction<ArrowUpRight size={13}/></a>}{!busy && <><button type="button" className="mp-text-button" onClick={() => void inspect()}>Check saved progress</button><button type="button" className="mp-text-button" onClick={() => void checkNextStep()}>Check next step</button></>}</div><p className="mp-keep-open">Keep this tab open during upload. If interrupted, return to this same browser and domain, then check the remaining cost to resume. Do not clear this site’s saved data.</p></div>}
         </section>}
 
-        {error && <div className="mp-error" role="alert"><strong>{errorReport ? 'Wallet signing issue.' : 'This step could not finish.'}</strong><p>{error}</p>{errorReport && <div className="mp-error-report"><p>Share this report here so the signing issue can be checked.</p><button type="button" className="mp-button mp-button-secondary" onClick={() => void copyErrorReport()}>{copied === 'error' ? <Check size={15}/> : <Copy size={15}/ >}{copied === 'error' ? 'Error report copied — paste it in chat' : 'Copy error report'}</button>{errorReportCopyFailed && <p role="status" className="mp-error-report-help">Clipboard access was blocked. Select and copy the report below.</p>}<details open={errorReportOpen} onToggle={event => setErrorReportOpen(event.currentTarget.open)}><summary>View error report</summary><label htmlFor="mp-wallet-error-report">Signing diagnostic report</label><textarea id="mp-wallet-error-report" readOnly value={JSON.stringify(errorReport, null, 2)} onFocus={event => event.currentTarget.select()} spellCheck={false}/></details></div>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Check the latest transaction<ArrowUpRight size={13}/></a>}</div>}
+        {error && <div className="mp-error" role="alert"><strong>{errorReport?.diagnosticVersion === 'otp-wallet-1' ? 'Wallet signing issue.' : 'This step could not finish.'}</strong><p>{error}</p>{errorReport && <div className="mp-error-report"><p>Share this report here so this step can be checked.</p><button type="button" className="mp-button mp-button-secondary" onClick={() => void copyErrorReport()}>{copied === 'error' ? <Check size={15}/> : <Copy size={15}/ >}{copied === 'error' ? 'Error report copied — paste it in chat' : 'Copy error report'}</button>{errorReportCopyFailed && <p role="status" className="mp-error-report-help">Clipboard access was blocked. Select and copy the report below.</p>}<details open={errorReportOpen} onToggle={event => setErrorReportOpen(event.currentTarget.open)}><summary>View error report</summary><label htmlFor="mp-wallet-error-report">Deployment diagnostic report</label><textarea id="mp-wallet-error-report" readOnly value={JSON.stringify(errorReport, null, 2)} onFocus={event => event.currentTarget.select()} spellCheck={false}/></details></div>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Check the latest transaction<ArrowUpRight size={13}/></a>}</div>}
         {notice && <div className="mp-notice" role="status">{notice}</div>}
 
         {result && <section className="mp-card mp-success" aria-labelledby="mp-result-heading"><div className="mp-success-icon"><CheckCircle2 size={27}/></div><span className="mp-eyebrow">PROGRAM VERIFIED</span><h2 id="mp-result-heading">The marketplace is deployed.</h2><p>The on-chain program code, Solana network, and owner authority match this project.</p><label className="mp-address-label" htmlFor="mp-program-result">Marketplace program address</label><div className="mp-result-address"><input id="mp-program-result" value={result.programId} readOnly onFocus={event => event.currentTarget.select()}/><button type="button" onClick={() => void copy('address')} aria-label="Copy marketplace program address">{copied === 'address' ? <Check size={17}/> : <Copy size={17}/>}</button></div><a className="mp-explorer" href={explorer('account', result.programId)} target="_blank" rel="noopener noreferrer">View program on Solscan<ArrowUpRight size={13}/></a><div className="mp-next-step"><h3>Next: verify a real purchase</h3><p>Public purchases are still off. Copy the public deployment report and paste it in your project chat. The next step is a controlled purchase, edit, and takeover check, including the treasury receipt, before opening the market.</p></div><button type="button" className="mp-button mp-button-primary" onClick={() => void copy('report')}>{copied === 'report' ? <Check size={16}/> : <Copy size={16}/ >}{copied === 'report' ? 'Report copied — paste it in chat' : 'Copy public deployment report'}</button><p className="mp-report-note">The report contains public addresses and program details. It contains no wallet keys or RPC credentials.</p></section>}
