@@ -3,7 +3,7 @@ import {Connection} from '@solana/web3.js';
 import {ArrowLeft, ArrowUpRight, Check, CheckCircle2, ChevronRight, Copy, LoaderCircle, Pause, RefreshCw, ShieldCheck, Wallet} from 'lucide-react';
 import {boundedSolanaFetch, SOLANA_TREASURY} from '../lib/solana-client';
 import {createDeploymentRpcFetch, DeploymentRpcError} from '../lib/solana-deployment-fetch';
-import {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, type DeploymentEstimate, type DeploymentInspection, type DeploymentProgress, type DeploymentResult} from '../lib/solana-deploy';
+import {DeploymentEngine, DeploymentPausedError, DeploymentSimulationError, type DeploymentEstimate, type DeploymentInspection, type DeploymentProgress, type DeploymentResult, type DeploymentStatusReport} from '../lib/solana-deploy';
 import {connectSolanaWallet, createVersionedSolanaDeploymentSigner, disconnectSolanaWallet, listSolanaWallets, onSolanaAccountChange, onSolanaWalletsChanged, type SolanaWallet, type SolanaWalletSession} from '../lib/solana-wallet';
 import {SolanaWalletCompatibilityError} from '../lib/solana-wallet-diagnostics';
 import '../marketplace-setup.css';
@@ -36,7 +36,13 @@ export default function MarketplaceSetup() {
   const [errorReportOpen, setErrorReportOpen] = useState(false);
   const [errorReportCopyFailed, setErrorReportCopyFailed] = useState(false);
   const [notice, setNotice] = useState('');
-  const [copied, setCopied] = useState<'address' | 'report' | 'error' | null>(null);
+  const [noticeIsPause, setNoticeIsPause] = useState(false);
+  const [deploymentPaused, setDeploymentPaused] = useState(false);
+  const [deploymentStatus, setDeploymentStatus] = useState<DeploymentStatusReport | null>(null);
+  const [statusReportOpen, setStatusReportOpen] = useState(false);
+  const [statusCopyFailed, setStatusCopyFailed] = useState(false);
+  const [inspectionRefreshFailed, setInspectionRefreshFailed] = useState(false);
+  const [copied, setCopied] = useState<'address' | 'report' | 'error' | 'status' | null>(null);
   const [pauseRequested, setPauseRequested] = useState(false);
   const engineRef = useRef<DeploymentEngine | null>(null);
   const pauseRequestedRef = useRef(false);
@@ -52,10 +58,26 @@ export default function MarketplaceSetup() {
   const total = progress?.totalBytes ?? inspection?.totalBytes ?? 1;
   // Upload completion is separate from the final on-chain verification.
   const percent = result ? 100 : Math.min(99, Math.floor(written / Math.max(total, 1) * 100));
+  const progressHeading = operation === 'deploying' ? 'Deployment in progress' : operation === 'checking' ? 'Checking saved progress' : deploymentPaused ? 'Deployment paused' : 'Saved deployment';
+  const progressMessage = progress?.message ?? (deploymentPaused ? 'No deployment is running. Your verified progress is saved.' : inspection?.pendingTransactions ? 'Saved transactions will be checked before any new signatures are requested.' : 'Your saved upload will be checked before resuming.');
 
   function clearErrorReport() {
     setErrorReport(null); setErrorReportOpen(false); setErrorReportCopyFailed(false);
     setCopied(previous => previous === 'error' ? null : previous);
+  }
+
+  function refreshStatusReport(engine: DeploymentEngine) {
+    // This is a local, diagnostic-only snapshot. Copying it must never ask
+    // for an RPC health check, wallet connection, signature or approval.
+    try {if (mounted.current) setDeploymentStatus(engine.getDeploymentStatus());}
+    catch { /* A report failure must not replace the original pause/error. */ }
+  }
+
+  function applyInspection(engine: DeploymentEngine, next: DeploymentInspection) {
+    if (!mounted.current) return;
+    setInspection(next); setProgress(null); setInspectionRefreshFailed(false);
+    refreshStatusReport(engine);
+    if (next.result) {setResult(next.result); setDeploymentPaused(false); if (next.result.signature) setLatestSignature(next.result.signature);}
   }
 
   async function checkHealth() {
@@ -98,6 +120,8 @@ export default function MarketplaceSetup() {
       if (!mounted.current) return;
       setProgress(update);
       if (update.signature) setLatestSignature(update.signature);
+      if (update.stage === 'paused') setDeploymentPaused(true);
+      if (engineRef.current) refreshStatusReport(engineRef.current);
     }});
     engineRef.current = engine;
     return engine;
@@ -106,7 +130,8 @@ export default function MarketplaceSetup() {
   async function exclusive(kind: Exclude<Operation, 'connecting' | null>, action: (engine: DeploymentEngine) => Promise<void>) {
     if (busyRef.current) return;
     busyRef.current = true;
-    setOperation(kind); setError(''); setNotice(''); clearErrorReport();
+    setOperation(kind); setError(''); setNotice(''); setNoticeIsPause(false); clearErrorReport();
+    if (kind === 'deploying') {setDeploymentPaused(false); setInspectionRefreshFailed(false);}
     try {
       if (!navigator.locks) throw Error('This browser cannot protect a deployment across tabs. Open the site over HTTPS in a current desktop browser before continuing.');
       await navigator.locks.request('own-this-page-deployment', {ifAvailable: true}, async lock => {
@@ -118,7 +143,24 @@ export default function MarketplaceSetup() {
       });
     } catch (caught) {
       if (mounted.current) {
-        if (caught instanceof DeploymentPausedError) setNotice(caught.message);
+        if (caught instanceof DeploymentPausedError) {
+          setNotice(caught.message); setNoticeIsPause(true); setDeploymentPaused(true);
+          const engine = engineRef.current;
+          if (engine) {
+            setOperation('checking');
+            refreshStatusReport(engine);
+            try {
+              // Inspection reads account state only. It does not settle,
+              // rebroadcast, create a replacement or request another signature.
+              const next = await engine.inspect();
+              applyInspection(engine, next);
+              if (mounted.current && next.result) {setNotice('The saved marketplace deployment is verified.'); setNoticeIsPause(false);}
+            } catch {
+              if (mounted.current) {setInspectionRefreshFailed(true); setProgress(previous => previous ? {...previous, stage: 'paused', message: 'Deployment paused. Last verified progress is shown.'} : null);}
+              refreshStatusReport(engine);
+            }
+          }
+        }
         else {
           setError(errorText(caught));
           if (caught instanceof SolanaWalletCompatibilityError || caught instanceof DeploymentSimulationError || caught instanceof DeploymentRpcError) setErrorReport(caught.report);
@@ -127,6 +169,7 @@ export default function MarketplaceSetup() {
     } finally {
       busyRef.current = false;
       pauseRequestedRef.current = false;
+      if (engineRef.current) refreshStatusReport(engineRef.current);
       if (mounted.current) {setOperation(null); setPauseRequested(false);}
     }
   }
@@ -135,10 +178,7 @@ export default function MarketplaceSetup() {
     setAccepted(false); setEstimate(null);
     await exclusive('checking', async engine => {
       const next = await engine.inspect();
-      if (!mounted.current) return;
-      setInspection(next);
-      if (next.result) {setResult(next.result); if (next.result.signature) setLatestSignature(next.result.signature);}
-      else setProgress(null);
+      applyInspection(engine, next);
     });
   }
 
@@ -211,7 +251,7 @@ export default function MarketplaceSetup() {
     await exclusive('estimating', async engine => {
       const nextInspection = await engine.inspect();
       if (!mounted.current) return;
-      setInspection(nextInspection);
+      applyInspection(engine, nextInspection);
       if (nextInspection.result) {setResult(nextInspection.result); return;}
       const quote = await engine.estimate();
       if (!mounted.current) return;
@@ -264,6 +304,20 @@ export default function MarketplaceSetup() {
     }
   }
 
+  async function copyDeploymentStatus() {
+    let report = deploymentStatus;
+    try {report = engineRef.current?.getDeploymentStatus() ?? report;} catch { /* Keep the last available safe snapshot. */ }
+    if (!report) return;
+    setDeploymentStatus(report);
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+      setCopied('status'); setStatusCopyFailed(false);
+    } catch {
+      setCopied(previous => previous === 'status' ? null : previous);
+      setStatusCopyFailed(true); setStatusReportOpen(true);
+    }
+  }
+
   return <div className="marketplace-setup">
     <header className="mp-header"><a className="mp-brand" href="/"><img src="/brand/own-this-page-logo.png" alt=""/><span>Own This Page</span></a><a className="mp-back" href="/"><ArrowLeft size={15}/><span>Back to the page</span></a></header>
     <main className="mp-layout">
@@ -284,11 +338,13 @@ export default function MarketplaceSetup() {
             <button type="button" className="mp-button mp-button-primary" onClick={() => void deploy()} disabled={busy || !ownerConnected || !accepted || !estimateFresh || estimate.requiredLamports <= 0}><Wallet size={16}/>{hasSavedDeployment ? 'Resume deployment in wallet' : 'Deploy marketplace in wallet'}</button>{!estimateFresh && !busy && <p className="mp-expired">Refresh the estimate above before approving.</p>}
           </div>}
 
-          {(progress || hasSavedDeployment) && <div className="mp-progress" role="status" aria-live="polite"><div className="mp-progress-heading"><strong>{operation === 'deploying' ? 'Deployment in progress' : inspection?.stage === 'pending' ? 'Checking your saved deployment' : 'Saved deployment'}</strong><span>{percent}%</span></div><progress value={percent} max={100} aria-label="Marketplace deployment progress"/><p>{progress?.message ?? (inspection?.pendingTransactions ? 'Saved transactions will be checked before any new signatures are requested.' : 'Your saved upload will be checked before resuming.')}</p><div className="mp-progress-actions">{operation === 'deploying' && <button type="button" className="mp-button mp-button-secondary" disabled={pauseRequested} onClick={() => {pauseRequestedRef.current = true; engineRef.current?.pause(); setPauseRequested(true);}}><Pause size={13}/>{pauseRequested ? 'Pausing after current batch…' : 'Pause after current batch'}</button>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Latest transaction<ArrowUpRight size={13}/></a>}{!busy && <><button type="button" className="mp-text-button" onClick={() => void inspect()}>Check saved progress</button><button type="button" className="mp-text-button" onClick={() => void checkNextStep()}>Check next step</button></>}</div><p className="mp-keep-open">Keep this tab open during upload. If interrupted, return to this same browser and domain, then check the remaining cost to resume. Do not clear this site’s saved data.</p></div>}
+          {(progress || hasSavedDeployment) && <div className="mp-progress" role="status" aria-live="polite"><div className="mp-progress-heading"><strong>{progressHeading}</strong><span>{percent}%</span></div><progress value={percent} max={100} aria-label="Marketplace deployment progress"/><p>{progressMessage}</p>{inspectionRefreshFailed && <p>Progress could not be refreshed. The last verified state is shown; you can still copy its deployment status below.</p>}<div className="mp-progress-actions">{operation === 'deploying' && <button type="button" className="mp-button mp-button-secondary" disabled={pauseRequested} onClick={() => {pauseRequestedRef.current = true; engineRef.current?.pause(); setPauseRequested(true);}}><Pause size={13}/>{pauseRequested ? 'Pausing after current batch…' : 'Pause after current batch'}</button>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Latest transaction<ArrowUpRight size={13}/></a>}{!busy && <><button type="button" className="mp-text-button" onClick={() => void inspect()}>Check saved progress</button><button type="button" className="mp-text-button" onClick={() => void checkNextStep()}>Check next step</button></>}</div><p className="mp-keep-open">Keep this tab open during upload. If interrupted, return to this same browser and domain. Do not clear this site’s saved data.</p></div>}
         </section>}
 
         {error && <div className="mp-error" role="alert"><strong>{errorReport?.diagnosticVersion === 'otp-wallet-1' ? 'Wallet signing issue.' : 'This step could not finish.'}</strong><p>{error}</p>{errorReport && <div className="mp-error-report"><p>Share this report here so this step can be checked.</p><button type="button" className="mp-button mp-button-secondary" onClick={() => void copyErrorReport()}>{copied === 'error' ? <Check size={15}/> : <Copy size={15}/ >}{copied === 'error' ? 'Error report copied — paste it in chat' : 'Copy error report'}</button>{errorReportCopyFailed && <p role="status" className="mp-error-report-help">Clipboard access was blocked. Select and copy the report below.</p>}<details open={errorReportOpen} onToggle={event => setErrorReportOpen(event.currentTarget.open)}><summary>View error report</summary><label htmlFor="mp-wallet-error-report">Deployment diagnostic report</label><textarea id="mp-wallet-error-report" readOnly value={JSON.stringify(errorReport, null, 2)} onFocus={event => event.currentTarget.select()} spellCheck={false}/></details></div>}{latestSignature && <a href={explorer('tx', latestSignature)} target="_blank" rel="noopener noreferrer">Check the latest transaction<ArrowUpRight size={13}/></a>}</div>}
-        {notice && <div className="mp-notice" role="status">{notice}</div>}
+        {notice && <div className={`mp-notice${noticeIsPause ? ' mp-notice-paused' : ''}`} role="status">{noticeIsPause && <strong>Deployment paused.</strong>}{noticeIsPause ? <p>{notice}</p> : notice}</div>}
+
+        {deploymentStatus && <section className="mp-card mp-status-report" aria-labelledby="mp-status-heading"><h3 id="mp-status-heading">Saved deployment status</h3><p>Copy the saved deployment state to help check what happened. Copying does not connect your wallet, sign, or send anything.</p>{deploymentStatus.lastBatch === null && <p>No transaction archive is available for this saved deployment. Earlier versions did not keep completed attempt details.</p>}<button type="button" className="mp-button mp-button-secondary" onClick={() => void copyDeploymentStatus()}>{copied === 'status' ? <Check size={15}/> : <Copy size={15}/ >}{copied === 'status' ? 'Deployment status copied — paste it in chat' : 'Copy deployment status'}</button>{statusCopyFailed && <p role="status">Clipboard access was blocked. Select and copy the report below.</p>}<details open={statusReportOpen} onToggle={event => setStatusReportOpen(event.currentTarget.open)}><summary>View deployment status</summary><p>The transaction list covers the latest saved signing group. Some transactions may not have been sent; this group may be earlier than the current pause.</p><p>An RPC acknowledgment means the provider returned the transaction signature. It does not confirm that the transaction landed on Solana.</p><label htmlFor="mp-deployment-status-report">Public deployment status report</label><textarea id="mp-deployment-status-report" readOnly value={JSON.stringify(deploymentStatus, null, 2)} onFocus={event => event.currentTarget.select()} spellCheck={false}/></details></section>}
 
         {result && <section className="mp-card mp-success" aria-labelledby="mp-result-heading"><div className="mp-success-icon"><CheckCircle2 size={27}/></div><span className="mp-eyebrow">PROGRAM VERIFIED</span><h2 id="mp-result-heading">The marketplace is deployed.</h2><p>The on-chain program code, Solana network, and owner authority match this project.</p><label className="mp-address-label" htmlFor="mp-program-result">Marketplace program address</label><div className="mp-result-address"><input id="mp-program-result" value={result.programId} readOnly onFocus={event => event.currentTarget.select()}/><button type="button" onClick={() => void copy('address')} aria-label="Copy marketplace program address">{copied === 'address' ? <Check size={17}/> : <Copy size={17}/>}</button></div><a className="mp-explorer" href={explorer('account', result.programId)} target="_blank" rel="noopener noreferrer">View program on Solscan<ArrowUpRight size={13}/></a><div className="mp-next-step"><h3>Next: verify a real purchase</h3><p>Public purchases are still off. Copy the public deployment report and paste it in your project chat. The next step is a controlled purchase, edit, and takeover check, including the treasury receipt, before opening the market.</p></div><button type="button" className="mp-button mp-button-primary" onClick={() => void copy('report')}>{copied === 'report' ? <Check size={16}/> : <Copy size={16}/ >}{copied === 'report' ? 'Report copied — paste it in chat' : 'Copy public deployment report'}</button><p className="mp-report-note">The report contains public addresses and program details. It contains no wallet keys or RPC credentials.</p></section>}
 

@@ -49,6 +49,7 @@ function fixture() {
     async getAccountInfoAndContext(key,options){assert(options.minContextSlot<=slot,'confirmed account floor must not use processed status tip');const a=accounts.get(key.toBase58());return {context:{slot},value:a?{...a,data:Buffer.from(a.data)}:null};},
     async getMinimumBalanceForRentExemption(size){return size*8+1000;},
     async getLatestBlockhash(){return {blockhash:Keypair.generate().publicKey.toBase58(),lastValidBlockHeight:height+150};},
+    async getLatestBlockhashAndContext(options){assert.equal(options.commitment,'confirmed');assert(options.minContextSlot<=slot);return {context:{slot},value:await rpc.getLatestBlockhash(options)};},
     async getFeeForMessage(){return {context:{slot},value:5000};},
     async getBalance(){return 100000000000;},
     async getBalanceAndContext(_owner,options){assert.equal(options.commitment,'confirmed');assert(options.minContextSlot<=slot,'wallet balance must honor the confirmed simulation floor');return {context:{slot},value:100000000000};},
@@ -216,6 +217,112 @@ await check('invalid or regressing successful simulation contexts stop before an
   }
 });
 
+await check('slow unsigned preparation is followed by a fresh contextual blockhash before the only wallet approval',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),simulate=f.rpc.simulateTransaction,latest=f.rpc.getLatestBlockhashAndContext,sign=f.signer.signTransactions;
+  let preparedMessage,freshHash,freshSlot;
+  f.rpc.simulateTransaction=async(tx,options)=>{
+    if(!options.sigVerify){preparedMessage=TransactionMessage.decompile(tx.message);f.advanceSlots(140);}
+    return simulate(tx,options);
+  };
+  f.rpc.getLatestBlockhashAndContext=async options=>{
+    assert(preparedMessage,'The refresh follows unsigned checks');
+    const result=await latest(options);assert.equal(options.minContextSlot,result.context.slot);
+    freshHash=result.value.blockhash;freshSlot=result.context.slot;return result;
+  };
+  f.signer.signTransactions=async transactions=>{
+    assert.equal(transactions[0].message.recentBlockhash,freshHash);
+    assert.notEqual(freshHash,preparedMessage.recentBlockhash);
+    const rebuilt=TransactionMessage.decompile(transactions[0].message);
+    assert.deepEqual(rebuilt.instructions,preparedMessage.instructions,'Only the unsigned blockhash changes');assert(rebuilt.payerKey.equals(preparedMessage.payerKey));
+    return sign(transactions);
+  };
+  f.onUpdate(p=>{if(p.stage==='uploading')e.pause();});
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);
+  assert.deepEqual(f.signedBatches,[1]);assert.equal(f.broadcasts.length,1);
+  const report=e.getDeploymentStatus();assert.equal(report.lastBatch.blockhashContextSlot,freshSlot);assert.equal(report.lastBatch.remainingBlocksAtSubmission,150);
+  assert.equal(report.lastBatch.receipts[0].status,'confirmed');assert.equal(report.lastBatch.receipts[0].rpcAcknowledged,true);
+});
+
+await check('invalid fresh blockhash contexts and expired or near-expiry signed groups cannot create pending packets or broadcast',async()=>{
+  {
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate(),latest=f.rpc.getLatestBlockhashAndContext;
+    f.rpc.getLatestBlockhashAndContext=async options=>{const result=await latest(options);e.pause();return result;};
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentPausedError);assert.equal(f.signedBatches.length,0);assert.equal(f.broadcasts.length,0);
+  }
+  for(const invalid of [-1,1.5,'100',99]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate(),latest=f.rpc.getLatestBlockhashAndContext;
+    f.rpc.getLatestBlockhashAndContext=async options=>({...await latest(options),context:{slot:invalid}});
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),/blockhash context|blockhash older/);
+    assert.equal(f.signedBatches.length,0);assert.equal(f.broadcasts.length,0);assert.equal(f.checkpoint().pending.length,0);
+  }
+  for(const count of [1,5])for(const remaining of [-1,0,1,count===1?59:71]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate(),sign=f.signer.signTransactions;
+    if(count===5){
+      const saved=f.checkpoint(),buffer=Buffer.alloc(binary.length+37);buffer.writeUInt32LE(1,0);buffer[4]=1;payer.publicKey.toBuffer().copy(buffer,5);
+      f.accounts.set(saved.bufferId,info(buffer));saved.walletBatchSafe=true;f.storage.setItem([...f.saved.keys()][0],JSON.stringify(saved));
+    }
+    f.signer.signTransactions=async transactions=>{const signed=await sign(transactions);f.advanceSlots(150-remaining);return signed;};
+    const height=f.rpc.getBlockHeight;
+    f.rpc.getBlockHeight=async options=>{assert.equal(options.commitment,'confirmed');assert.equal(options.minContextSlot,freshFloor);return height();};
+    let freshFloor=0;const simulate=f.rpc.simulateTransaction;
+    f.rpc.simulateTransaction=async(tx,options)=>{const result=await simulate(tx,options);if(options.sigVerify)freshFloor=result.context.slot;return result;};
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/None of this group was submitted/.test(error.message));
+    assert.deepEqual(f.signedBatches,[count]);assert.equal(f.broadcasts.length,0);assert.equal(f.checkpoint().pending.length,0);assert.equal(f.checkpoint().lastBatch,undefined);
+  }
+});
+
+await check('partial upload expiry preserves verified progress and all public receipts with acknowledgment versus unknown outcomes across reload',async()=>{
+  for(const acknowledgment of [true,false]){
+    const f=fixture(),e=f.fresh(),estimate=await e.estimate(),send=f.rpc.sendRawTransaction,statuses=f.rpc.getSignatureStatuses,updates=[];
+    let droppedSignature=null,expire=false;
+    f.onUpdate(p=>updates.push(p));
+    f.rpc.sendRawTransaction=async(bytes,options)=>{
+      if(f.signedBatches.at(-1)===5&&!droppedSignature){
+        droppedSignature=signatureText(VersionedTransaction.deserialize(bytes).signatures[0]);expire=true;f.broadcasts.push(droppedSignature);
+        if(acknowledgment)return droppedSignature;
+        throw Error('secret transport detail https://example.invalid/?api-key=private');
+      }
+      return send(bytes,options);
+    };
+    f.rpc.getSignatureStatuses=async ids=>{if(expire){f.expire();expire=false;}return statuses(ids);};
+    await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),error=>error instanceof DeploymentPausedError&&/upload transaction expired/.test(error.message));
+    assert.deepEqual(f.signedBatches,[1,1,5]);assert.equal(f.checkpoint().pending.length,0);
+    const report=e.getDeploymentStatus(),last=updates.at(-1),receipt=report.lastBatch.receipts.find(r=>r.signature===droppedSignature);
+    assert.equal(report.writtenBytes,5*DEPLOYMENT_WRITE_BYTES);assert.equal(last.stage,'paused');assert.equal(last.writtenBytes,report.writtenBytes);
+    assert.equal(report.lastBatch.receipts.length,5);assert.equal(report.lastBatch.receipts.filter(r=>r.status==='confirmed').length,4);assert.equal(receipt.status,'expired');
+    assert.equal(receipt.rpcAcknowledged,acknowledgment);assert.equal(receipt.lastAttempt,acknowledgment?'acknowledged':'unknown');assert.equal(receipt.attemptCount,1);
+    assert(receipt.firstAttemptAt>=report.lastBatch.walletReturnedAt);assert.equal(receipt.firstAttemptAt,receipt.lastAttemptAt);
+    assert(report.lastBatch.remainingBlocksAtSubmission>=72);assert.equal(report.pendingCount,0);
+    const raw=f.checkpoint(),serialized=JSON.stringify(report);for(const secret of [raw.bufferSeed,raw.programSeed,'api-key','private','raw','blockhash\"'])assert(!serialized.includes(secret));
+    const returned=e.getDeploymentStatus();returned.lastBatch.receipts[0].status='pending';assert.notEqual(e.getDeploymentStatus().lastBatch.receipts[0].status,'pending','The public report is detached from recovery state');
+    const reloaded=f.fresh();await reloaded.inspect();assert.deepEqual(reloaded.getDeploymentStatus(),report);
+  }
+});
+
+await check('optional receipt archives are bounded and cannot strand or leak an otherwise valid recovery checkpoint',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate();f.loseBefore();
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),/unavailable/);
+  const original=f.checkpoint();assert.equal(original.pending.length,1);
+  for(const archive of [undefined,{...original.lastBatch,secret:'private',receipts:original.lastBatch.receipts.map(r=>({...r,secret:'private',lastRpcError:{httpStatus:200,rpcCode:-32002,message:'private',preflight:{err:{InstructionError:[4,{Custom:17}]},unitsConsumed:145,contextSlot:321,logs:['private']}}}))},{...original.lastBatch,receipts:Array(6).fill(original.lastBatch.receipts[0])},{...original.lastBatch,preparedAt:'secret'},'private']){
+    f.storage.setItem([...f.saved.keys()][0],JSON.stringify({...original,lastBatch:archive}));
+    const reloaded=f.fresh();await reloaded.inspect();const report=reloaded.getDeploymentStatus();
+    assert.equal(report.pendingCount,1);assert(!JSON.stringify(report).includes('private'));assert(!JSON.stringify(report).includes('secret'));
+    assert.deepEqual(f.checkpoint().pending,original.pending);
+    if(archive?.secret==='private'){
+      assert.equal(report.lastBatch.receipts.length,1);
+      assert.deepEqual(report.lastBatch.receipts[0].lastRpcError,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:200,rpcCode:-32002,preflight:{err:{InstructionError:[4,{Custom:17}]},unitsConsumed:145,contextSlot:321}});
+    }else assert.equal(report.lastBatch,null);
+  }
+});
+
+await check('an archive persistence failure is surfaced immediately instead of being mistaken for an ambiguous transport timeout',async()=>{
+  const f=fixture(),e=f.fresh(),estimate=await e.estimate(),set=f.storage.setItem;
+  f.storage.setItem=(key,value)=>{if(JSON.parse(value).lastBatch?.receipts.some(r=>r.attemptCount>0))throw Error('quota');set(key,value);};
+  f.rpc.getSignatureStatuses=()=>assert.fail('Storage failure must not enter a retry or confirmation loop');
+  await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),/recovery record could not be saved/);
+  assert.equal(f.broadcasts.length,0);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.checkpoint().pending.length,1);
+});
+
 await check('a relay HTTP 400 surfaces immediately with its receipt intact and resume rebroadcasts the same approved packet',async()=>{
   const f=fixture();let e=f.fresh();const estimate=await e.estimate(),send=f.rpc.sendRawTransaction,packets=[];
   f.rpc.getSignatureStatuses=()=>assert.fail('An explicit submission error should surface before confirmation polling');
@@ -225,6 +332,8 @@ await check('a relay HTTP 400 surfaces immediately with its receipt intact and r
     assert.deepEqual(error.report,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:400,rpcCode:-32600});return true;
   });
   const saved=f.checkpoint();assert.equal(saved.pending.length,1);assert.equal(saved.pending[0].raw,packets[0]);assert.deepEqual(f.signedBatches,[1]);assert.equal(f.applied.length,0);
+  const submissionReport=e.getDeploymentStatus().lastBatch.receipts[0];assert.equal(submissionReport.lastAttempt,'rpc-error');assert.equal(submissionReport.rpcAcknowledged,false);
+  assert.deepEqual(submissionReport.lastRpcError,{diagnosticVersion:'otp-rpc-1',method:'sendTransaction',httpStatus:400,rpcCode:-32600});
   f.rpc.getSignatureStatuses=async ids=>({context:{slot:100},value:ids.map(id=>f.receipts.get(id)??null)});
   e=f.fresh();
   await assert.rejects(()=>e.run(f.signer,estimate.requiredLamports),DeploymentRpcError);

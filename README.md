@@ -71,6 +71,10 @@ The estimate separates program deposits, temporary upload funds, and a conservat
 
 Every submitted packet is saved before broadcast. Expired transactions require finalized expiry evidence and account reconciliation before fresh signing. Different messages or invalid wallet signatures are rejected; retries use the same approved signed bytes. The final program must match the exact release and retained admin upgrade authority.
 
+New signing requests get a fresh confirmed blockhash after the unsigned checks. The signed transactions must still pass verification, fee bounds and simulation, and have enough remaining block height before broadcast. A near-expiry approval pauses without submitting that group; signed or unresolved packets are never silently given a new blockhash.
+
+If deployment pauses, the page refreshes the actual uploaded bytes and offers **Copy deployment status** without requiring wallet approval. The report contains public account IDs and bounded summaries for the latest group, including transaction signatures, RPC acknowledgments and checked outcomes. RPC acknowledgment is not confirmation. Reports exclude raw transactions, recovery seeds and RPC credentials. Older saved deployments may lack archived details for receipts already cleared by a previous version; their uploaded bytes and remaining signed receipts are still checked normally.
+
 After verification, copy the public program address or deployment report into the project conversation. No ZIP download is needed. It is a marketplace program address, separate from the token CA. Verification does not automatically enable public purchases.
 
 ### Activate after verification

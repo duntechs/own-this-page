@@ -162,6 +162,7 @@ async function firstDeploymentTransaction(api) {
     async getAccountInfoAndContext() {return {context: {slot: 100}, value: null};},
     async getMinimumBalanceForRentExemption(size) {return size * 8 + 1000;},
     async getLatestBlockhash() {return {blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 260};},
+    async getLatestBlockhashAndContext(options) {assert.equal(options.commitment, 'confirmed'); assert.equal(options.minContextSlot, 100); return {context: {slot: 100}, value: await this.getLatestBlockhash()};},
     async getFeeForMessage() {return {context: {slot: 100}, value: 5000};},
     async getBalance() {return 100_000_000_000;},
     async getRecentPrioritizationFees() {return [{prioritizationFee: 10000}];},
