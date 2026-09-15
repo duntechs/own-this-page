@@ -11,7 +11,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
     "test:market": "node scripts/test-solana-pricing.mjs && node scripts/test-solana-client.mjs",
-    "test:deployment": "node scripts/test-solana-deploy.mjs && node scripts/test-deployment-wallet.mjs && node scripts/test-deployment-fetch.mjs && node scripts/test-rpc-worker.mjs && node scripts/test-image-worker.mjs",
+    "test:deployment": "node scripts/test-solana-deploy.mjs && node scripts/test-deployment-wallet.mjs && node scripts/test-deployment-fetch.mjs && node scripts/test-rpc-worker.mjs && node scripts/test-image-worker.mjs && node scripts/test-browser-wallet.mjs",
     "test:deployment:local": "node scripts/test-solana-deploy-local.mjs",
     "preview:file": "node scripts/make-preview.mjs"
   },

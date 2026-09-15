@@ -158,7 +158,9 @@ export function createVersionedSolanaDeploymentSigner(session: SolanaWalletSessi
     const signed = await Promise.all(output.map(async (item, index) => {
       if (item.signedTransaction.length > 1232) throw Error('The wallet returned an oversized transaction.');
       const transaction = VersionedTransaction.deserialize(item.signedTransaction);
-      if (transaction.version !== 0 || !Buffer.from(transaction.message.serialize()).equals(messages[index]) || transaction.signatures.length !== 1) {
+      // The browser Buffer polyfill requires both operands to be Buffers.
+      // Node also accepts Uint8Array, so SSR tests alone miss this boundary.
+      if (transaction.version !== 0 || !Buffer.from(transaction.message.serialize()).equals(Buffer.from(messages[index])) || transaction.signatures.length !== 1) {
         throw Error('The wallet changed the deployment transaction. Nothing was submitted.');
       }
       if (!await crypto.subtle.verify({name: 'Ed25519'}, key, Uint8Array.from(transaction.signatures[0]), messages[index])) {
@@ -179,7 +181,7 @@ export async function signSolanaImageUpload(session: SolanaWalletSession, messag
   const expected = Uint8Array.from(message);
   const output = await withSolanaTimeout(feature.signMessage({account, message: Uint8Array.from(expected)}), 90_000);
   currentAccount(session);
-  if (output.length !== 1 || !Buffer.from(output[0].signedMessage).equals(expected) || output[0].signature.length !== 64) throw Error('The wallet changed the image upload authorization.');
+  if (output.length !== 1 || !Buffer.from(output[0].signedMessage).equals(Buffer.from(expected)) || output[0].signature.length !== 64) throw Error('The wallet changed the image upload authorization.');
   const key = await crypto.subtle.importKey('raw', Uint8Array.from(account.publicKey), {name: 'Ed25519'}, false, ['verify']);
   if (!await crypto.subtle.verify('Ed25519', key, Uint8Array.from(output[0].signature), expected)) throw Error('The image upload signature is invalid.');
   currentAccount(session);
